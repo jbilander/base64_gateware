@@ -1,3 +1,6 @@
 [submodule "rtl/TG68K.C"]
 	path = rtl/TG68K.C
 	url = https://github.com/TobiFlex/TG68K.C
+[submodule "rtl/fx68k"]
+	path = rtl/fx68k
+	url = https://github.com/fredrequin/fx68k
