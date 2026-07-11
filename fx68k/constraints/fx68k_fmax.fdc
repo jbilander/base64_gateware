@@ -1,0 +1,6 @@
+# Synplify Pro synthesis constraint (.fdc) for the fx68k fmax trial.
+# Add this to the Diamond project as a Synplify constraint file so the
+# 85 MHz target is visible at SYNTHESIS time (LPF FREQUENCY only affects PAR).
+create_clock -name {clk_sys} -period 11.764 [get_nets {clk_sys}]
+# 11.764 ns = 85.0 MHz. If the net name differs after synthesis, adjust
+# to the PLL output net (may appear as clk_sys or pll.clkop).

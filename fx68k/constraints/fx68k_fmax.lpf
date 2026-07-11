@@ -5,8 +5,9 @@ SYSCONFIG CONFIG_IOVOLTAGE=3.3 COMPRESS_CONFIG=ON MCCLK_FREQ=38.8;
 LOCATE COMP "clk_25m" SITE "P6";
 IOBUF  PORT "clk_25m" IO_TYPE=LVCMOS33;
 FREQUENCY PORT "clk_25m" 25.0 MHz;
-# PLL output: the number that matters. PAR must meet this for the
-# EN_SPACING=1 (42.5 MHz effective) trial to be viable as-is.
+
+# The number that matters: PAR must meet this for EN_SPACING=1 (42.5 MHz
+# effective) to be viable as-is.
 FREQUENCY NET "clk_sys" 85.0 MHz;
 
 LOCATE COMP "led_r_n" SITE "B11";
@@ -16,9 +17,8 @@ IOBUF PORT "led_r_n" IO_TYPE=LVCMOS33;
 IOBUF PORT "led_g_n" IO_TYPE=LVCMOS33;
 IOBUF PORT "led_b_n" IO_TYPE=LVCMOS33;
 
-# --- Documented fx68k multicycle relaxations (author's timing notes) ---
-# Enable these AFTER a first baseline run, and verify the cell names against
-# the Synplify netlist (Ir / microAddr / nanoAddr may carry hierarchy
-# prefixes or renames). Syntax reference: Diamond Help > LPF > MULTICYCLE.
+# --- Documented fx68k multicycle relaxations (fredrequin/ijor timing notes) ---
+# Enable AFTER a first baseline run; verify cell names against the Synplify
+# netlist first (they may carry hierarchy prefixes).
 # MULTICYCLE FROM CELL "*Ir*" TO CELL "*microAddr*" 2 X;
 # MULTICYCLE FROM CELL "*Ir*" TO CELL "*nanoAddr*" 2 X;
