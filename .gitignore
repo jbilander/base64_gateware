@@ -29,3 +29,4 @@ prj/*/*.ccl
 prj/*/*.sty
 prj/*/*.dir
 prj/*/*.dir/*
+prj/*/.recovery
