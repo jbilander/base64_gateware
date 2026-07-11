@@ -25,3 +25,7 @@ m68k_cross_baremetal/vlink
 *.gtkw
 site.mk
 
+prj/*/*.ccl
+prj/*/*.sty
+prj/*/*.dir
+prj/*/*.dir/*
