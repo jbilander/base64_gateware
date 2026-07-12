@@ -30,3 +30,5 @@ prj/*/*.sty
 prj/*/*.dir
 prj/*/*.dir/*
 prj/*/.recovery
+*.svf
+*.trc

@@ -1,11 +1,11 @@
 <Project ModBy="Inserter" SigType="0" Name="/home/jbilander/Projects/base64_gateware/prj/base64_fx68k/base64_reset_capture.rvl" Date="2026-07-12">
     <IP Version="1_6_042617"/>
     <Design DesignEntry="Schematic/Verilog HDL" Synthesis="synplify" DeviceFamily="ECP5U" DesignName="base64_fx68k"/>
-    <Core InsertDataset="0" Insert="1" Reveal_sig="702066026" Name="base64_top_LA0" ID="0">
+    <Core InsertDataset="0" Insert="1" Reveal_sig="702092038" Name="base64_top_LA0" ID="0">
         <Setting>
             <Clock SampleClk="clk_12x" SampleEnable="0" EnableClk="" EnableClk_Pri="0"/>
             <TraceBuffer Implementation="0" BitTimeStamp="0" hasTimeStamp="0" IncTrigSig="0" BufferDepth="2048"/>
-            <Capture Mode="0" MinSamplesPerTrig="8"/>
+            <Capture Mode="0" MinSamplesPerTrig="16"/>
             <Event CntEnable="0" MaxEventCnt="8"/>
             <TrigOut Polarity="0" MinPulseWidth="0" TrigOutNetType="1" EnableTrigOut="0" TrigOutNet="reveal_debug_base64_top_LA0_net"/>
             <DistRAM Disable="0"/>
@@ -74,6 +74,21 @@
                 <Sig Type="SIG" Name="ext_reset"/>
                 <Sig Type="SIG" Name="core_oreset_n"/>
                 <Sig Type="SIG" Name="core_ohalted_n"/>
+                <Bus Name="ph_cnt">
+                    <Sig Type="SIG" Name="ph_cnt:0"/>
+                    <Sig Type="SIG" Name="ph_cnt:1"/>
+                    <Sig Type="SIG" Name="ph_cnt:2"/>
+                    <Sig Type="SIG" Name="ph_cnt:3"/>
+                </Bus>
+                <Sig Type="SIG" Name="clk_7m"/>
+                <Sig Type="SIG" Name="core_e"/>
+                <Sig Type="SIG" Name="core_vma_n"/>
+                <Sig Type="SIG" Name="cpu_vpa_n"/>
+                <Sig Type="SIG" Name="s_reset_n:1"/>
+                <Sig Type="SIG" Name="s_vpa_n:1"/>
+                <Sig Type="SIG" Name="s_halt_n:1"/>
+                <Sig Type="SIG" Name="bus_enable"/>
+                <Sig Type="SIG" Name="bus_released"/>
             </Trace>
             <Trigger>
                 <TU Serialbits="0" Type="0" ID="1" Sig="ext_reset,"/>
