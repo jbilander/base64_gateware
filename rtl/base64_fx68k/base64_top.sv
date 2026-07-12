@@ -144,7 +144,7 @@ module base64_top (
         .clk      (clk),
         .enPhi1   (en_phi1),
         .enPhi2   (en_phi2),
-        .HALTn    (s_halt_n[1] | ~core_ohalted_n),  // external halt only
+        .HALTn    (s_halt_n[1] | ~core_oreset_n | ~core_ohalted_n),
         .extReset (ext_reset),
         .pwrUp    (~pwrup_done),
         .oRESETn  (core_oreset_n),
