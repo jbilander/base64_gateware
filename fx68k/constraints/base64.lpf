@@ -1,3 +1,4 @@
+rvl_alias "clk_12x" "clk_12x";
 # =====================================================================
 # Base64 revC carrier + iCESugar-Pro v1.3 (LFE5U-25F-6BG256C)
 # Auto-generated from Base64.net + iCESugar-Pro v1.3 netlist annotations
@@ -11,15 +12,15 @@ SYSCONFIG CONFIG_IOVOLTAGE=3.3 COMPRESS_CONFIG=ON MCCLK_FREQ=38.8 SLAVE_SPI_PORT
 # 7.09/7.16 MHz motherboard clock, buffered by 74LVC1G17 (PT27A, PCLKT0_1)
 LOCATE COMP "clk_7m"   SITE "C7";
 IOBUF  PORT "clk_7m"   IO_TYPE=LVCMOS33 PULLMODE=NONE;
-FREQUENCY PORT "clk_7m" 7.20 MHz;
+# FREQUENCY PORT "clk_7m" 7.20 MHz;    # -> base64.fdc (create_clock)
 # ICS570B x12 = 85.13 (PAL) / 85.91 (NTSC) MHz (PL26A, PCLKT6_1)
 LOCATE COMP "clk_12x"  SITE "L1";
 IOBUF  PORT "clk_12x"  IO_TYPE=LVCMOS33 PULLMODE=NONE;
-FREQUENCY PORT "clk_12x" 86.00 MHz;
+# FREQUENCY PORT "clk_12x" 86.00 MHz;  # -> base64.fdc (create_clock)
 # On-module 25 MHz oscillator (PL47C, dedicated GPLL0 input, always available)
-LOCATE COMP "clk_25m"  SITE "P6";
-IOBUF  PORT "clk_25m"  IO_TYPE=LVCMOS33 PULLMODE=NONE;
-FREQUENCY PORT "clk_25m" 25.00 MHz;
+# LOCATE COMP "clk_25m"  SITE "P6";    # unused in compat mode
+# IOBUF  PORT "clk_25m"  IO_TYPE=LVCMOS33 PULLMODE=NONE;
+# FREQUENCY PORT "clk_25m" 25.00 MHz;
 
 # ---------------- 68000 socket (via SN74CBTD3861, 5V side on Amiga bus) ----------------
 LOCATE COMP "cpu_a[1]" SITE "A5";   # 68k A1     carrier net PT18A    SODIMM 63
@@ -219,6 +220,8 @@ LOCATE COMP "led_g_n" SITE "A11";
 LOCATE COMP "led_b_n" SITE "A12";
 IOBUF PORT "led_r_n" IO_TYPE=LVCMOS33; IOBUF PORT "led_g_n" IO_TYPE=LVCMOS33; IOBUF PORT "led_b_n" IO_TYPE=LVCMOS33;
 # NOTE: module nets named from MCU perspective: ball A9 = MCU TX -> FPGA RX, B9 = MCU RX -> FPGA TX
-LOCATE COMP "uart_rx" SITE "A9";
+# LOCATE COMP "uart_rx" SITE "A9";     # unused in compat mode
 LOCATE COMP "uart_tx" SITE "B9";
-IOBUF PORT "uart_rx" IO_TYPE=LVCMOS33 PULLMODE=UP; IOBUF PORT "uart_tx" IO_TYPE=LVCMOS33;
+# IOBUF PORT "uart_rx" IO_TYPE=LVCMOS33 PULLMODE=UP;   # unused in compat mode
+IOBUF PORT "uart_tx" IO_TYPE=LVCMOS33;
+BLOCK JTAGPATHS;

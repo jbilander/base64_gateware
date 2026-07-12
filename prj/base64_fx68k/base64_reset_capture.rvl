@@ -1,0 +1,84 @@
+<Project ModBy="Inserter" SigType="0" Name="/home/jbilander/Projects/base64_gateware/prj/base64_fx68k/base64_reset_capture.rvl" Date="2026-07-12">
+    <IP Version="1_6_042617"/>
+    <Design DesignEntry="Schematic/Verilog HDL" Synthesis="synplify" DeviceFamily="ECP5U" DesignName="base64_fx68k"/>
+    <Core InsertDataset="0" Insert="1" Reveal_sig="702066026" Name="base64_top_LA0" ID="0">
+        <Setting>
+            <Clock SampleClk="clk_12x" SampleEnable="0" EnableClk="" EnableClk_Pri="0"/>
+            <TraceBuffer Implementation="0" BitTimeStamp="0" hasTimeStamp="0" IncTrigSig="0" BufferDepth="2048"/>
+            <Capture Mode="0" MinSamplesPerTrig="8"/>
+            <Event CntEnable="0" MaxEventCnt="8"/>
+            <TrigOut Polarity="0" MinPulseWidth="0" TrigOutNetType="1" EnableTrigOut="0" TrigOutNet="reveal_debug_base64_top_LA0_net"/>
+            <DistRAM Disable="0"/>
+        </Setting>
+        <Dataset Name="Base">
+            <Trace>
+                <Bus Name="core_a">
+                    <Sig Type="SIG" Name="core_a:1"/>
+                    <Sig Type="SIG" Name="core_a:2"/>
+                    <Sig Type="SIG" Name="core_a:3"/>
+                    <Sig Type="SIG" Name="core_a:4"/>
+                    <Sig Type="SIG" Name="core_a:5"/>
+                    <Sig Type="SIG" Name="core_a:6"/>
+                    <Sig Type="SIG" Name="core_a:7"/>
+                    <Sig Type="SIG" Name="core_a:8"/>
+                    <Sig Type="SIG" Name="core_a:9"/>
+                    <Sig Type="SIG" Name="core_a:10"/>
+                    <Sig Type="SIG" Name="core_a:11"/>
+                    <Sig Type="SIG" Name="core_a:12"/>
+                    <Sig Type="SIG" Name="core_a:13"/>
+                    <Sig Type="SIG" Name="core_a:14"/>
+                    <Sig Type="SIG" Name="core_a:15"/>
+                    <Sig Type="SIG" Name="core_a:16"/>
+                    <Sig Type="SIG" Name="core_a:17"/>
+                    <Sig Type="SIG" Name="core_a:18"/>
+                    <Sig Type="SIG" Name="core_a:19"/>
+                    <Sig Type="SIG" Name="core_a:20"/>
+                    <Sig Type="SIG" Name="core_a:21"/>
+                    <Sig Type="SIG" Name="core_a:22"/>
+                    <Sig Type="SIG" Name="core_a:23"/>
+                    <Sig Type="SIG" Name="core_a:24"/>
+                    <Sig Type="SIG" Name="core_a:25"/>
+                    <Sig Type="SIG" Name="core_a:26"/>
+                    <Sig Type="SIG" Name="core_a:27"/>
+                    <Sig Type="SIG" Name="core_a:28"/>
+                    <Sig Type="SIG" Name="core_a:29"/>
+                    <Sig Type="SIG" Name="core_a:30"/>
+                    <Sig Type="SIG" Name="core_a:31"/>
+                </Bus>
+                <Bus Name="cpu_d">
+                    <Sig Type="SIG" Name="cpu_d:0"/>
+                    <Sig Type="SIG" Name="cpu_d:1"/>
+                    <Sig Type="SIG" Name="cpu_d:2"/>
+                    <Sig Type="SIG" Name="cpu_d:3"/>
+                    <Sig Type="SIG" Name="cpu_d:4"/>
+                    <Sig Type="SIG" Name="cpu_d:5"/>
+                    <Sig Type="SIG" Name="cpu_d:6"/>
+                    <Sig Type="SIG" Name="cpu_d:7"/>
+                    <Sig Type="SIG" Name="cpu_d:8"/>
+                    <Sig Type="SIG" Name="cpu_d:9"/>
+                    <Sig Type="SIG" Name="cpu_d:10"/>
+                    <Sig Type="SIG" Name="cpu_d:11"/>
+                    <Sig Type="SIG" Name="cpu_d:12"/>
+                    <Sig Type="SIG" Name="cpu_d:13"/>
+                    <Sig Type="SIG" Name="cpu_d:14"/>
+                    <Sig Type="SIG" Name="cpu_d:15"/>
+                </Bus>
+                <Sig Type="SIG" Name="core_as_n"/>
+                <Sig Type="SIG" Name="core_uds_n"/>
+                <Sig Type="SIG" Name="core_lds_n"/>
+                <Sig Type="SIG" Name="core_rw"/>
+                <Sig Type="SIG" Name="s_dtack_n:1"/>
+                <Sig Type="SIG" Name="core_fc0"/>
+                <Sig Type="SIG" Name="core_fc1"/>
+                <Sig Type="SIG" Name="core_fc2"/>
+                <Sig Type="SIG" Name="ext_reset"/>
+                <Sig Type="SIG" Name="core_oreset_n"/>
+                <Sig Type="SIG" Name="core_ohalted_n"/>
+            </Trace>
+            <Trigger>
+                <TU Serialbits="0" Type="0" ID="1" Sig="ext_reset,"/>
+                <TE MaxSequence="1" MaxEvnCnt="1" ID="1" Resource="1"/>
+            </Trigger>
+        </Dataset>
+    </Core>
+</Project>

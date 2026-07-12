@@ -1,0 +1,29 @@
+# Synplify Pro timing constraints — base64_fx68k, COMPAT mode (7.09 MHz)
+# ---------------------------------------------------------------------------
+# clk_12x is the 85.1 MHz ICS570B clock (x12 of the 7M bus, PLL-locked).
+create_clock -name {clk_12x} -period 11.72 [get_ports {clk_12x}]
+
+# clk_7m sampled as data in the clk_12x domain (2FF), not a real clock domain.
+create_clock -name {clk_7m} -period 141.0 [get_ports {clk_7m}]
+
+# The two are phase-related but we resync with 2FF -> treat as async groups.
+set_clock_groups -asynchronous -group {clk_12x} -group {clk_7m}
+
+# ---------------------------------------------------------------------------
+# COMPAT-MODE MULTICYCLE
+# In compat mode the fx68k core advances only on the phase enables (enPhi1/
+# enPhi2), which fire once every 6 clk_12x cycles. So core-internal register-
+# to-register paths have ~6 cycles to settle, not 1. Without this the tool
+# evaluates them against a single 11.72 ns period and reports false setup
+# failures (the -0.47 ns / 99-path miss on the rIr->microToNanoAddr decode).
+#
+# Scope: ONLY the fx68k core instance's internal paths (u_* named "cpu").
+# The wrapper's phase generator, 2FF synchronizers, and I/O tristate logic
+# are NOT covered here and remain single-cycle (correct — they run every clk).
+#
+# NOTE: verify the instance path prefix matches your netlist. Top instance of
+# fx68k is "cpu" (see base64_top.sv). If Synplify flattens/renames, adjust the
+# get_cells pattern. Multicycle of 6 for setup, 5 for hold (standard N/N-1).
+# ---------------------------------------------------------------------------
+set_multicycle_path -from [get_cells {cpu.*}] -to [get_cells {cpu.*}] -setup 6
+set_multicycle_path -from [get_cells {cpu.*}] -to [get_cells {cpu.*}] -hold  5
