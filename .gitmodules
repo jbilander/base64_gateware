@@ -4,3 +4,6 @@
 [submodule "rtl/fx68k"]
 	path = rtl/fx68k
 	url = https://github.com/fredrequin/fx68k
+[submodule "rtl/fx68k_upstream"]
+	path = rtl/fx68k_upstream
+	url = https://github.com/ijor/fx68k

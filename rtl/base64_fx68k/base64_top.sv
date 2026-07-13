@@ -7,7 +7,7 @@
 // guishable from a stock 68000. Turbo is a later, separate build.
 //
 // Pairs with base64.lpf. Toolchain: Diamond / Synplify Pro.
-// fx68k ports match fredrequin/fx68k (E_rise/E_fall, eab[31:1]).
+// fx68k ports match UPSTREAM ijor/fx68k (no E_rise/E_fall, eab[23:1]).
 //
 // FIRST-CONTACT SAFETY: CBT switch OEs are held OFF (bus isolated) until the
 // PLL is locked and the power-up counter expires, so the FPGA never drives
@@ -128,11 +128,11 @@ module base64_top (
     // fx68k core (fredrequin fork)
     // ------------------------------------------------------------------
     wire        core_rw, core_as_n, core_lds_n, core_uds_n;
-    wire        core_e, core_e_rise, core_e_fall, core_vma_n;
+    wire        core_e, core_vma_n;
     wire        core_fc0, core_fc1, core_fc2;
     wire        core_bg_n, core_oreset_n, core_ohalted_n;
     wire [15:0] core_dout;
-    wire [31:1] core_a;
+    wire [23:1] core_a;
 
     // External reset: a real 68000 resets when RESET & HALT are both driven
     // low externally. Mask our own open-drain drive so the RESET instruction
@@ -150,8 +150,6 @@ module base64_top (
         .oRESETn  (core_oreset_n),
         .oHALTEDn (core_ohalted_n),
         .E        (core_e),
-        .E_rise   (core_e_rise),
-        .E_fall   (core_e_fall),
         .VPAn     (s_vpa_n[1]),
         .VMAn     (core_vma_n),
         .ASn      (core_as_n),
@@ -181,7 +179,7 @@ module base64_top (
     wire bus_released = ~s_bgack_n[1] | (~core_bg_n & core_as_n & ~s_br_n[1]);
     wire drv_bus = ~bus_released;
 
-    assign cpu_a     = drv_bus ? core_a[23:1] : 23'bz;
+    assign cpu_a     = drv_bus ? core_a : 23'bz;
     assign cpu_as_n  = drv_bus ? core_as_n    : 1'bz;
     assign cpu_uds_n = drv_bus ? core_uds_n   : 1'bz;
     assign cpu_lds_n = drv_bus ? core_lds_n   : 1'bz;
@@ -229,7 +227,9 @@ module base64_top (
     // red on while held in reset, blue = bus isolated.
     // ------------------------------------------------------------------
     reg [20:0] e_div;
-    always @(posedge clk) if (core_e_rise) e_div <= e_div + 21'd1;
+    reg e_d;
+    always @(posedge clk) e_d <= core_e;
+    always @(posedge clk) if (core_e & ~e_d) e_div <= e_div + 21'd1;
     assign led_g_n = ~e_div[20];
     assign led_r_n = ~ext_reset;      // lit while in reset
     assign led_b_n =  bus_enable;     // lit (low) while bus isolated

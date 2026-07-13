@@ -25,5 +25,5 @@ set_clock_groups -asynchronous -group {clk_12x} -group {clk_7m}
 # fx68k is "cpu" (see base64_top.sv). If Synplify flattens/renames, adjust the
 # get_cells pattern. Multicycle of 6 for setup, 5 for hold (standard N/N-1).
 # ---------------------------------------------------------------------------
-set_multicycle_path -from [get_cells {cpu.*}] -to [get_cells {cpu.*}] -setup 6
-set_multicycle_path -from [get_cells {cpu.*}] -to [get_cells {cpu.*}] -hold  5
+#set_multicycle_path -from [get_cells {cpu.*}] -to [get_cells {cpu.*}] -setup 6
+#set_multicycle_path -from [get_cells {cpu.*}] -to [get_cells {cpu.*}] -hold  5

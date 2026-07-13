@@ -6,22 +6,13 @@
         <Source name="../../rtl/base64_fx68k/base64_top.sv" type="Verilog" type_short="Verilog">
             <Options VerilogStandard="System Verilog" top_module="base64_top"/>
         </Source>
-        <Source name="../../rtl/fx68k/fx68k_pkg.sv" type="Verilog" type_short="Verilog">
+        <Source name="../../rtl/fx68k_upstream/fx68k.sv" type="Verilog" type_short="Verilog">
             <Options VerilogStandard="System Verilog"/>
         </Source>
-        <Source name="../../rtl/fx68k/fx68kAlu.sv" type="Verilog" type_short="Verilog">
+        <Source name="../../rtl/fx68k_upstream/fx68kAlu.sv" type="Verilog" type_short="Verilog">
             <Options VerilogStandard="System Verilog"/>
         </Source>
-        <Source name="../../rtl/fx68k/uaddrPla.sv" type="Verilog" type_short="Verilog">
-            <Options VerilogStandard="System Verilog"/>
-        </Source>
-        <Source name="../../rtl/fx68k/fx68k.sv" type="Verilog" type_short="Verilog">
-            <Options VerilogStandard="System Verilog"/>
-        </Source>
-        <Source name="../../rtl/fx68k/bram/fx68kRegs_generic.sv" type="Verilog" type_short="Verilog">
-            <Options VerilogStandard="System Verilog"/>
-        </Source>
-        <Source name="../../rtl/fx68k/bram/fx68kRom_generic.sv" type="Verilog" type_short="Verilog">
+        <Source name="../../rtl/fx68k_upstream/uaddrPla.sv" type="Verilog" type_short="Verilog">
             <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../fx68k/constraints/base64.fdc" type="Synplify Design Constraints File" type_short="SDC">
