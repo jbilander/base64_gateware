@@ -107,7 +107,7 @@ module base64_top (
     // --- phase generator: divide clk_12x by 12, aligned to 7M ---
     // PHASE_OFS trims where the emulated CPU clock edges fall vs the real 7M
     // (C1/C3). Tune on hardware with Reveal against E and the 7M edge.
-    localparam [3:0] PHASE_OFS = 4'd4;
+    localparam [3:0] PHASE_OFS = 4'd3;
     reg  [3:0] ph_cnt = 4'd0;
     reg        r_7m_d;
     wire       edge_7m = s_7m[1] & ~r_7m_d;
