@@ -81,10 +81,16 @@ module base64_top (
     wire clk = clk_12x;
 
     // --- power-up / reset sequencing ---
-    reg  [15:0] pwrup_cnt = 16'd0;
-    wire        pwrup_done = pwrup_cnt[15];
+    // Long cold-boot hold: ~98 ms after configuration before the core's
+    // first fetch, so the USB ROM board, ICS570B lock, rails and the
+    // Amiga's own POR are all settled long before we fetch the reset
+    // vector. Cures the cold-boot double-fault wedge (dim LED / random
+    // early guru colors, recoverable with Ctrl-A-A). Warm resets are
+    // unaffected: this counter runs once per FPGA configuration.
+    reg  [23:0] pwrup_cnt = 24'd0;
+    wire        pwrup_done = pwrup_cnt[23];
     always @(posedge clk)
-        if (!pwrup_done) pwrup_cnt <= pwrup_cnt + 16'd1;
+        if (!pwrup_done) pwrup_cnt <= pwrup_cnt + 24'd1;
 
     // --- synchronize async inputs (2FF) ---
     reg [1:0] s_dtack_n, s_vpa_n, s_berr_n, s_br_n, s_bgack_n;
@@ -137,7 +143,15 @@ module base64_top (
     // External reset: a real 68000 resets when RESET & HALT are both driven
     // low externally. Mask our own open-drain drive so the RESET instruction
     // doesn't reset the core itself.
-    wire ext_reset = (~s_reset_n[1] & ~s_halt_n[1] & core_oreset_n & core_ohalted_n)
+    // External reset: RESET & HALT both low resets the core. Masked ONLY
+    // while the core itself executes the RESET instruction (oRESETn low),
+    // since we drive the shared /RST net then. Deliberately NOT masked by
+    // oHALTEDn: a double-bus-faulted (halted) 68000 must respond to
+    // external reset - that's how a real Amiga recovers from a guru. (We
+    // drive HALT low while halted; the resulting low net asserts ext_reset
+    // and the core resets itself out of the halt, exactly like real
+    // silicon on the A500's tied RESET+HALT net.)
+    wire ext_reset = (~s_reset_n[1] & ~s_halt_n[1] & core_oreset_n)
                      | ~pwrup_done;
 
     fx68k cpu (
@@ -176,7 +190,12 @@ module base64_top (
     // Bus ownership & tri-state. A real 68000 releases A/D/AS/UDS/LDS/RW/FC/
     // VMA while the bus is granted; E and BG stay driven.
     // ------------------------------------------------------------------
-    wire bus_released = ~s_bgack_n[1] | (~core_bg_n & core_as_n & ~s_br_n[1]);
+    // Released when BGACK is asserted, or when we've granted BG and our own
+    // AS is idle. Deliberately NOT dependent on BR: a requester may legally
+    // release BR before/as it asserts BGACK; re-driving in that window
+    // would cause contention. fx68k holds BG until BGACK is seen, so the
+    // second term covers the handoff and the first term the DMA burst.
+    wire bus_released = ~s_bgack_n[1] | (~core_bg_n & core_as_n);
     wire drv_bus = ~bus_released;
 
     assign cpu_a     = drv_bus ? core_a : 23'bz;
@@ -193,9 +212,35 @@ module base64_top (
     wire drv_data = drv_bus & ~core_as_n & ~core_rw;
     assign cpu_d = drv_data ? core_dout : 16'bz;
 
+    // ------------------------------------------------------------------
+    // Halt watchdog: a double-bus-faulted 68000 just halts; on the A500 the
+    // only true recovery is a MACHINE reset (the CIAs must reset so the ROM
+    // overlay at $0 is restored - a CPU-only reset refetches garbage from
+    // chip RAM and faults again forever). So when the core halts, drive the
+    // shared /RST net low for ~25 ms (like Gary's POR), resetting Gary and
+    // the CIAs, then release: overlay restored, vector fetched from ROM,
+    // clean system-wide restart. Turns any guru/cold-boot crash into
+    // authentic self-recovery.
+    reg        auto_rst = 1'b0;
+    reg [21:0] auto_rst_cnt = 22'd0;
+    always @(posedge clk) begin
+        if (!auto_rst) begin
+            auto_rst_cnt <= 22'd0;
+            // trigger: core halted (double fault), not our RESET instruction
+            if (pwrup_done && !core_ohalted_n && core_oreset_n)
+                auto_rst <= 1'b1;
+        end else begin
+            auto_rst_cnt <= auto_rst_cnt + 22'd1;
+            if (auto_rst_cnt[21])            // ~24.6 ms at 85.13 MHz
+                auto_rst <= 1'b0;
+        end
+    end
+
     // Open-drain RESET / HALT (drive low or release to the board pull-up).
-    assign cpu_reset_n = core_oreset_n  ? 1'bz : 1'b0;
-    assign cpu_halt_n  = core_ohalted_n ? 1'bz : 1'b0;
+    // Driven low by the RESET instruction (oRESETn), by a halted core
+    // (oHALTEDn, as real silicon does), or by the halt watchdog above.
+    assign cpu_reset_n = (core_oreset_n  & ~auto_rst) ? 1'bz : 1'b0;
+    assign cpu_halt_n  = (core_ohalted_n & ~auto_rst) ? 1'bz : 1'b0;
 
     // Autoconfig: transparent pass-through until implemented.
     assign cfgout_n = s_cfgin_n[1];
@@ -204,7 +249,18 @@ module base64_top (
     // CBT switches: connect the bus only once locked & powered up. Until the
     // bitstream loads, ECP5 weak pull-ups hold these high (isolated).
     // ------------------------------------------------------------------
-    wire bus_enable = pwrup_done;
+    // CBT switches: connect only when powered up AND bus owned. During a
+    // bus grant the switches OPEN, physically isolating D0-15 (U2/U3),
+    // AS/UDS/LDS/RW/A18-23 (U4) and A1-17 (U7/U8). NOTE: FC0-2 (U6) and
+    // VMA (U5) ride ALWAYS-ON switches, so for those two the internal
+    // tristate (drv_bus ? ... : 'bz) is the sole and required protection -
+    // both are implemented above. E and BG (U5) stay driven, as on a real
+    // 68000. All remaining U5/U6 channels are inputs to us. Registered so
+    // the OE pins are glitch-free; the one-clock lag is the safe order on
+    // both edges (pins tristate before the switch opens; the switch closes
+    // before the core can start its next cycle).
+    reg bus_enable = 1'b0;
+    always @(posedge clk) bus_enable <= pwrup_done & drv_bus;
     assign cbt_oe_d0_7_n   = ~bus_enable;
     assign cbt_oe_d8_15_n  = ~bus_enable;
     assign cbt_oe_ctl_hi_n = ~bus_enable;
@@ -232,6 +288,6 @@ module base64_top (
     always @(posedge clk) if (core_e & ~e_d) e_div <= e_div + 21'd1;
     assign led_g_n = ~e_div[20];
     assign led_r_n = ~ext_reset;      // lit while in reset
-    assign led_b_n =  bus_enable;     // lit (low) while bus isolated
+    assign led_b_n =  bus_enable;     // lit while isolated (incl. during DMA grants)
 
 endmodule
