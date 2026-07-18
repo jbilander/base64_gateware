@@ -1,10 +1,23 @@
 // ============================================================================
 // base64_top.sv  —  Base64 carrier + iCESugar-Pro, COMPAT MODE (7.09 MHz)
 //
-// Cycle-exact 68000 replacement. fx68k (fredrequin fork) driven by phase
+// Cycle-exact 68000 replacement. fx68k (upstream ijor) driven by phase
 // enables locked to the motherboard 7M clock via the ICS570B x12 (85.1 MHz).
 // One 68k cycle per 12 master clocks -> effective 7.09/7.16 MHz, indistin-
 // guishable from a stock 68000. Turbo is a later, separate build.
+//
+// NEW: Zorro II autoconfig SD-card device (SF2000 adaptation). As the CPU,
+// our own 64KB I/O space is served by the INTERNAL-MUX pattern: cycles to
+// the board go out on the physical bus unchanged (AS/addr/strobes as always,
+// Gary's auto-DTACK is simply ignored), while the core's DTACKn / iEdb /
+// VPAn / BERRn inputs are muxed to internal sources. Zero changes to the
+// tristate / CBT / arbitration logic; internal cycles even complete during
+// DMA grants. Modules: autoconfig_zii_b64.v, sd_subsystem.v (which wraps the
+// UNCHANGED sdcard.v/shifter.v/fifo.v/tx_cpu_buf.v/rx_cpu_buf.v), boot ROM
+// in EBR initialised from sfsd.mem.
+//
+// BUILD TRAP: sfsd.mem joins microrom.mem/nanorom.mem — must be present in
+// prj/base64_fx68k/impl1/ before build; Diamond "Clean" deletes it.
 //
 // Pairs with base64.lpf. Toolchain: Diamond / Synplify Pro.
 // fx68k ports match UPSTREAM ijor/fx68k (no E_rise/E_fall, eab[23:1]).
@@ -40,7 +53,7 @@ module base64_top (
     inout  wire        cpu_reset_n,   // open-drain bidirectional
     inout  wire        cpu_halt_n,    // open-drain bidirectional
 
-    // Autoconfig daisy chain (J2)
+    // Autoconfig daisy chain (J2). CFGIN jumpered to GND = first in chain.
     input  wire        cfgin_n,
     output wire        cfgout_n,
 
@@ -62,6 +75,11 @@ module base64_top (
     output wire        sdram_cas_n,
     output wire        sdram_we_n,
     output wire        sdram_cs_n,
+
+    // On-module micro-SD slot, used in SPI mode:
+    //   sd_clk = SCLK, sd_cmd = MOSI, sd_d[0] = MISO, sd_d[3] = CS_n,
+    //   sd_d[2:1] released (add PULLMODE=UP in the LPF on sd_cmd/sd_d).
+    //   The slot has no card-detect line; CD is tied "present" internally.
     output wire        sd_clk,
     inout  wire        sd_cmd,
     inout  wire [3:0]  sd_d,
@@ -96,6 +114,22 @@ module base64_top (
     reg [1:0] s_dtack_n, s_vpa_n, s_berr_n, s_br_n, s_bgack_n;
     reg [1:0] s_reset_n, s_halt_n, s_cfgin_n, s_7m;
     reg [2:0] s_ipl_a, s_ipl_n;
+
+    // 7M capture hardening: the ICS570B is a zero-delay multiplier, so 7M
+    // edges arrive at the FPGA coincident with clk_12x edges. Sampling
+    // clk_7m directly on the rising edge is therefore a race decided by the
+    // (unconstrained) routing delta between the clock tree and the 7m data
+    // path - it can flip by one cycle between builds, shifting the
+    // EFFECTIVE phase alignment and requiring a different PHASE_OFS per
+    // build (observed: the original build wanted 4'd3, later fuller builds
+    // 4'd2). Capturing on the FALLING edge puts the sample 5.86 ns away
+    // from the coincident edge - far outside the +/-1-2 ns routing
+    // variation - making the captured cycle deterministic across builds
+    // and seeds. NOTE: after this change PHASE_OFS is calibrated once and
+    // is then stable forever (try current value first, then +/-1).
+    reg s_7m_fall;
+    always @(negedge clk) s_7m_fall <= clk_7m;
+
     always @(posedge clk) begin
         s_dtack_n <= {s_dtack_n[0], cpu_dtack_n};
         s_vpa_n   <= {s_vpa_n[0],   cpu_vpa_n};
@@ -105,7 +139,7 @@ module base64_top (
         s_reset_n <= {s_reset_n[0], cpu_reset_n};
         s_halt_n  <= {s_halt_n[0],  cpu_halt_n};
         s_cfgin_n <= {s_cfgin_n[0], cfgin_n};
-        s_7m      <= {s_7m[0],      clk_7m};
+        s_7m      <= {s_7m[0],      s_7m_fall};
         s_ipl_a   <= cpu_ipl_n;
         s_ipl_n   <= s_ipl_a;
     end
@@ -113,7 +147,7 @@ module base64_top (
     // --- phase generator: divide clk_12x by 12, aligned to 7M ---
     // PHASE_OFS trims where the emulated CPU clock edges fall vs the real 7M
     // (C1/C3). Tune on hardware with Reveal against E and the 7M edge.
-    localparam [3:0] PHASE_OFS = 4'd3;
+    localparam [3:0] PHASE_OFS = 4'd2;
     reg  [3:0] ph_cnt = 4'd0;
     reg        r_7m_d;
     wire       edge_7m = s_7m[1] & ~r_7m_d;
@@ -131,7 +165,7 @@ module base64_top (
     wire en_phi2 = (ph_cnt == 4'd6);
 
     // ------------------------------------------------------------------
-    // fx68k core (fredrequin fork)
+    // fx68k core (upstream ijor)
     // ------------------------------------------------------------------
     wire        core_rw, core_as_n, core_lds_n, core_uds_n;
     wire        core_e, core_vma_n;
@@ -154,6 +188,100 @@ module base64_top (
     wire ext_reset = (~s_reset_n[1] & ~s_halt_n[1] & core_oreset_n)
                      | ~pwrup_done;
 
+    // ------------------------------------------------------------------
+    // Autoconfig + SD-card device (internal bus slaves)
+    // ------------------------------------------------------------------
+    // Device reset: must fire on EVERY /RST assertion, including the RESET
+    // instruction (which loops back through the open-drain pin into
+    // s_reset_n) - Kickstart executes RESET early in boot and then expects
+    // all expansions unconfigured, so this must NOT use ext_reset (which
+    // deliberately masks the RESET instruction for the core itself).
+    wire devices_reset = ~s_reset_n[1] | ~pwrup_done;
+
+    wire         ac_oe, ac_access, sd_configured, ac_dtack_n;
+    wire [15:12] ac_dout;
+    wire [7:0]   base_sd;
+    wire         cfgout_int_n;
+
+    wire         sd_space, sd_dtack_n;
+    wire [15:0]  sd_dout;
+    wire         sd_miso_w, sd_ss_n_w, sd_sclk_w, sd_mosi_w;
+
+    autoconfig_zii_b64 autoconfig (
+        .clk          (clk),
+        .reset        (devices_reset),
+        .cfgin_n      (s_cfgin_n[1]),
+        .as_n         (core_as_n),
+        .uds_n        (core_uds_n),
+        .lds_n        (core_lds_n),
+        .rw           (core_rw),
+        .a_high       (core_a[23:16]),
+        .a_low        (core_a[6:1]),
+        .d_in         (core_dout[15:12]),
+        .d_out        (ac_dout),
+        .data_oe      (ac_oe),
+        .ac_access    (ac_access),
+        .base_sd      (base_sd),
+        .sd_configured(sd_configured),
+        .cfgout_n     (cfgout_int_n),
+        .dtack_n      (ac_dtack_n)
+    );
+
+    sd_subsystem sdsys (
+        .clk          (clk),
+        .reset        (devices_reset),
+        .a            (core_a),
+        .as_n         (core_as_n),
+        .uds_n        (core_uds_n),
+        .lds_n        (core_lds_n),
+        .rw           (core_rw),
+        .d_in         (core_dout),
+        .sd_configured(sd_configured),
+        .base_sd      (base_sd),
+        .sd_space     (sd_space),
+        .d_out        (sd_dout),
+        .dtack_n      (sd_dtack_n),
+        .rom_we       (1'b0),          // flash_preload lands here in phase 3b
+        .rom_waddr    (15'd0),
+        .rom_wdata    (8'd0),
+        .sd_miso      (sd_miso_w),
+        .sd_cd_n      (1'b0),          // no CD line on the module slot: present
+        .sd_ss_n      (sd_ss_n_w),
+        .sd_sclk      (sd_sclk_w),
+        .sd_mosi      (sd_mosi_w)
+    );
+
+    // Core input muxes - the whole internal-slave trick. own_space decode is
+    // glitch-safe: the 68000 holds the address stable from before AS to after
+    // AS, and sd_configured/base_sd/cfgout_n only change at cycle boundaries
+    // (cfgout_n is registered on the rising edge of AS).
+    //
+    // REGISTERED: the core's inputs must come from flops, exactly as they did
+    // pre-SD (s_*_n[1] were 2FF outputs feeding the core directly). Muxing
+    // combinationally in front of iEdb/DTACKn added logic levels to paths the
+    // 85 MHz build has no margin for. The one-clock (11.7 ns) added latency
+    // is invisible at 7 MHz bus pace: worst case DTACK is recognised one
+    // master clock later, i.e. the same category of delay as the existing
+    // 2FF synchronisers, and slaves hold DTACK until AS ends anyway.
+    wire own_space = ac_access | sd_space;
+
+    reg        core_dtack_n;
+    reg [15:0] core_iedb;
+    reg        core_vpa_n, core_berr_n;
+    always @(posedge clk) begin
+        core_dtack_n <= ac_access ? ac_dtack_n :
+                        sd_space  ? sd_dtack_n :
+                                    s_dtack_n[1];
+
+        core_iedb    <= ac_oe                 ? {ac_dout, 12'hFFF} :
+                        (sd_space && core_rw) ? sd_dout            :
+                                                cpu_d;
+
+        // Never let external VPA/BERR terminate an internal cycle.
+        core_vpa_n   <= own_space ? 1'b1 : s_vpa_n[1];
+        core_berr_n  <= own_space ? 1'b1 : s_berr_n[1];
+    end
+
     fx68k cpu (
         .clk      (clk),
         .enPhi1   (en_phi1),
@@ -164,7 +292,7 @@ module base64_top (
         .oRESETn  (core_oreset_n),
         .oHALTEDn (core_ohalted_n),
         .E        (core_e),
-        .VPAn     (s_vpa_n[1]),
+        .VPAn     (core_vpa_n),
         .VMAn     (core_vma_n),
         .ASn      (core_as_n),
         .eRWn     (core_rw),
@@ -173,15 +301,15 @@ module base64_top (
         .FC2      (core_fc2),
         .FC1      (core_fc1),
         .FC0      (core_fc0),
-        .DTACKn   (s_dtack_n[1]),
-        .BERRn    (s_berr_n[1]),
+        .DTACKn   (core_dtack_n),
+        .BERRn    (core_berr_n),
         .BRn      (s_br_n[1]),
         .BGn      (core_bg_n),
         .BGACKn   (s_bgack_n[1]),
         .IPL2n    (s_ipl_n[2]),
         .IPL1n    (s_ipl_n[1]),
         .IPL0n    (s_ipl_n[0]),
-        .iEdb     (cpu_d),
+        .iEdb     (core_iedb),
         .oEdb     (core_dout),
         .eab      (core_a)
     );
@@ -195,6 +323,11 @@ module base64_top (
     // release BR before/as it asserts BGACK; re-driving in that window
     // would cause contention. fx68k holds BG until BGACK is seen, so the
     // second term covers the handoff and the first term the DMA burst.
+    // NOTE: cycles to our own autoconfig/SD space intentionally still go out
+    // on the bus (AS/addr/strobes, data on writes) - nothing on the A500
+    // decodes E8/E9 onto the data bus, the core ignores external DTACK for
+    // those cycles via the mux above, and this keeps the proven tristate
+    // logic completely untouched.
     wire bus_released = ~s_bgack_n[1] | (~core_bg_n & core_as_n);
     wire drv_bus = ~bus_released;
 
@@ -242,8 +375,10 @@ module base64_top (
     assign cpu_reset_n = (core_oreset_n  & ~auto_rst) ? 1'bz : 1'b0;
     assign cpu_halt_n  = (core_ohalted_n & ~auto_rst) ? 1'bz : 1'b0;
 
-    // Autoconfig: transparent pass-through until implemented.
-    assign cfgout_n = s_cfgin_n[1];
+    // Autoconfig chain: CFGOUT asserts once our board is configured or shut
+    // up (registered at end-of-cycle inside the shell), then downstream
+    // boards see their CFGIN. Replaces the old transparent pass-through.
+    assign cfgout_n = cfgout_int_n;
 
     // ------------------------------------------------------------------
     // CBT switches: connect the bus only once locked & powered up. Until the
@@ -268,15 +403,27 @@ module base64_top (
     assign cbt_oe_a1_7_n   = ~bus_enable;
 
     // ------------------------------------------------------------------
-    // Idle module resources (compat mode uses none of these yet)
+    // Idle module resources (SDRAM/uart still unused in compat mode)
     // ------------------------------------------------------------------
     assign sdram_a = 13'd0;  assign sdram_ba = 2'd0;
     assign sdram_dq = 16'bz; assign sdram_dqm = 2'b11;
     assign sdram_clk = 1'b0; assign sdram_cke = 1'b0;
     assign sdram_ras_n = 1'b1; assign sdram_cas_n = 1'b1;
     assign sdram_we_n = 1'b1;  assign sdram_cs_n = 1'b1;
-    assign sd_clk = 1'b0; assign sd_cmd = 1'bz; assign sd_d = 4'bz;
     assign uart_tx = 1'b1;
+
+    // ------------------------------------------------------------------
+    // SD slot in SPI mode (replaces the old idle assigns).
+    // CS_n idles high out of reset (slave_select resets 0), so the card
+    // stays deselected until the driver talks to it.
+    // ------------------------------------------------------------------
+    assign sd_clk    = sd_sclk_w;      // SCLK
+    assign sd_cmd    = sd_mosi_w;      // MOSI (always driven; card only
+                                       // listens while CS_n low)
+    assign sd_d[3]   = sd_ss_n_w;      // CS_n
+    assign sd_d[2:1] = 2'bzz;          // unused in SPI mode; pull up in LPF
+    assign sd_d[0]   = 1'bz;           // MISO - input to us
+    assign sd_miso_w = sd_d[0];
 
     // ------------------------------------------------------------------
     // Status LEDs (active low): green pulses with E (core running),
@@ -289,5 +436,14 @@ module base64_top (
     assign led_g_n = ~e_div[20];
     assign led_r_n = ~ext_reset;      // lit while in reset
     assign led_b_n =  bus_enable;     // lit while isolated (incl. during DMA grants)
+
+    // ------------------------------------------------------------------
+    // Phase 3b (not yet enabled): flash_preload streams the driver ROM from
+    // the W25Q256 at 0x100000 into the sd_subsystem BRAM during the pwrup
+    // hold. When enabling: instantiate flash_preload, route its rom_we/
+    // rom_waddr/rom_wdata into sdsys, add flash CS/MOSI/MISO pins (N8/T8/T7)
+    // to the port list + LPF, and gate the hold:
+    //     wire pwrup_done = pwrup_cnt[23] & load_done;
+    // ------------------------------------------------------------------
 
 endmodule
