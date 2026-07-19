@@ -136,12 +136,12 @@ initial begin
     bus_read_b(24'hE90001, d); check(d, 16'h00FF, 16'h001F, "ROM byte0 @odd/LDS");
     bus_read_b(24'hE90003, d); check(d, 16'h00FF, 16'h000F, "ROM byte1 @odd/LDS");
     bus_read_b(24'hE9000B, d); check(d, 16'h00FF, 16'h003F, "ROM byte5 @odd/LDS");
-    // bootloader callback pattern: payload byte n at base+1+0xCC0+2n
-    // (file offset 0x660 = hunk header 000003F3...)
-    bus_read_b(24'hE90CC1, d); check(d, 16'h00FF, 16'h0000, "payload[0]=00");
-    bus_read_b(24'hE90CC7, d); check(d, 16'h00FF, 16'h00F3, "payload[3]=F3 (hunk 3F3)");
     // mirrored on the upper lane too (monitor peeks / robustness)
     bus_read(24'hE90000, d); check(d, 16'hFFFF, 16'h1F1F, "ROM byte0 mirrored both lanes");
+    // NOTE: exact payload offset depends on da_Size (0x330 in the original
+    // ROM, 0x354 in LIV2's zero-length-hunk-fix ROM), so we don't pin a
+    // hardcoded payload address here - the DiagArea head + mirror above
+    // fully exercise the ROM-serving hardware, which is size-independent.
 
     // --- enable write: CLKDIV = 0x00FA, then read back registers ---
     bus_write(24'hE90000, 16'h00FA);
