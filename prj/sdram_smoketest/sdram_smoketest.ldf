@@ -4,9 +4,18 @@
     <Implementation title="impl1" dir="impl1" description="impl1" synthesis="synplify" default_strategy="Strategy1">
         <Options def_top="sdram_smoke_top"/>
         <Source name="../../rtl/sdram_smoketest/sdram_smoke_top.sv" type="Verilog" type_short="Verilog">
-            <Options VerilogStandard="System Verilog"/>
+            <Options VerilogStandard="System Verilog" top_module="sdram_smoke_top"/>
+        </Source>
+        <Source name="../../rtl/sdram_smoketest/sdram_ctrl.v" type="Verilog" type_short="Verilog">
+            <Options/>
+        </Source>
+        <Source name="../../fx68k/constraints/base64_sdram_smoke.fdc" type="Synplify Design Constraints File" type_short="SDC">
+            <Options/>
         </Source>
         <Source name="../../fx68k/constraints/base64_sdram_smoke.lpf" type="Logic Preference" type_short="LPF">
+            <Options/>
+        </Source>
+        <Source name="impl1/impl1.xcf" type="Programming Project File" type_short="Programming">
             <Options/>
         </Source>
     </Implementation>
