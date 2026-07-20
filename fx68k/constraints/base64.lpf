@@ -214,11 +214,11 @@ LOCATE COMP "sd_d[3]" SITE "G12";
 DEFINE PORT GROUP "SD_G" "sd_*";
 IOBUF GROUP "SD_G" IO_TYPE=LVCMOS33 PULLMODE=UP DRIVE=8;
 
-# ---------------- Module RGB LED (common anode 3V3, drive LOW to light) & UART to iCELink USB-CDC ----------------
-LOCATE COMP "led_r_n" SITE "B11";
-LOCATE COMP "led_g_n" SITE "A11";
-LOCATE COMP "led_b_n" SITE "A12";
-IOBUF PORT "led_r_n" IO_TYPE=LVCMOS33; IOBUF PORT "led_g_n" IO_TYPE=LVCMOS33; IOBUF PORT "led_b_n" IO_TYPE=LVCMOS33;
+# ---------------- Module RGB LED (ACTIVE-HIGH: drive 1 to light, verified on hardware) & UART to iCELink USB-CDC ----------------
+LOCATE COMP "led_r" SITE "B11";
+LOCATE COMP "led_g" SITE "A11";
+LOCATE COMP "led_b" SITE "A12";
+IOBUF PORT "led_r" IO_TYPE=LVCMOS33; IOBUF PORT "led_g" IO_TYPE=LVCMOS33; IOBUF PORT "led_b" IO_TYPE=LVCMOS33;
 # NOTE: module nets named from MCU perspective: ball A9 = MCU TX -> FPGA RX, B9 = MCU RX -> FPGA TX
 # LOCATE COMP "uart_rx" SITE "A9";     # unused in compat mode
 LOCATE COMP "uart_tx" SITE "B9";

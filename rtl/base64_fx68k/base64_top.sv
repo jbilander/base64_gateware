@@ -84,9 +84,9 @@ module base64_top (
     inout  wire        sd_cmd,
     inout  wire [3:0]  sd_d,
 
-    output wire        led_r_n,
-    output wire        led_g_n,
-    output wire        led_b_n,
+    output wire        led_r,
+    output wire        led_g,
+    output wire        led_b,
     output wire        uart_tx,
     input  wire        uart_rx
 );
@@ -251,6 +251,100 @@ module base64_top (
         .sd_mosi      (sd_mosi_w)
     );
 
+    // ------------------------------------------------------------------
+    // Fast RAM: Zorro II autoconfig (8MB, graceful fallback) bridging the
+    // Amiga bus to the on-module IS42S16160B via the verified sdram_ctrl.
+    // Fastmem cycles are served by internal muxing AND isolated from the
+    // motherboard by opening the switchable CBTs (fm_active -> bus_enable),
+    // so CPU<->SDRAM traffic runs decoupled from the 7 MHz chip bus.
+    // ------------------------------------------------------------------
+    wire        fm_space, fm_active, fm_dtack_n, fm_cfgout_n;
+    wire [15:0] fm_dout;
+    wire        fm_ac_access, fm_ac_oe, fm_ac_dtack_n;
+    wire [3:0]  fm_ac_dout;
+    // sdram_ctrl handshake
+    wire        sd_req, sd_we, sd_ack, sdram_ready;
+    wire [23:0] sd_saddr;
+    wire [15:0] sd_wdata, sd_rdata;
+    wire [1:0]  sd_byte_en;
+    // internal SDRAM clock (forwarded to the pin via ODDR below)
+    wire        sdram_clk_int;
+
+    // Autoconfig daisy-chain within our board: the SD ROM device configures
+    // first (it holds the boot ROM KS needs early), then passes CFGOUT to the
+    // fastmem device's CFGIN via cfgout_int_n. The fastmem device's CFGOUT
+    // (fm_cfgout_n) drives the external chain pin below. Declared here so it
+    // precedes the fastmem instance (default_nettype none requires it).
+    wire fm_cfgin_n = cfgout_int_n;
+
+    fastmem_zii #(
+        .OFFER_SPLIT(1'b1)
+    ) fastmem (
+        .clk        (clk),
+        .reset      (devices_reset),
+        .cfgin_n    (fm_cfgin_n),
+        .as_n       (core_as_n),
+        .uds_n      (core_uds_n),
+        .lds_n      (core_lds_n),
+        .rw         (core_rw),
+        .a          (core_a),
+        .d_in       (core_dout),
+        .fm_space   (fm_space),
+        .fm_dout    (fm_dout),
+        .fm_dtack_n (fm_dtack_n),
+        .fm_active  (fm_active),
+        .cfgout_n   (fm_cfgout_n),
+        .fm_ac_access (fm_ac_access),
+        .fm_ac_dout   (fm_ac_dout),
+        .fm_ac_oe     (fm_ac_oe),
+        .fm_ac_dtack_n(fm_ac_dtack_n),
+        .req        (sd_req),
+        .we         (sd_we),
+        .saddr      (sd_saddr),
+        .wdata      (sd_wdata),
+        .byte_en    (sd_byte_en),
+        .ack        (sd_ack),
+        .rdata      (sd_rdata),
+        .sdram_ready(sdram_ready)
+    );
+
+    sdram_ctrl #(
+        .CLK_HZ(85_130_000)
+    ) sdramc (
+        .clk        (clk),
+        .reset      (devices_reset),
+        .req        (sd_req),
+        .we         (sd_we),
+        .addr       (sd_saddr),
+        .wdata      (sd_wdata),
+        .byte_en    (sd_byte_en),
+        .ack        (sd_ack),
+        .rdata      (sd_rdata),
+        .ready      (sdram_ready),
+        .sdram_a    (sdram_a),
+        .sdram_ba   (sdram_ba),
+        .sdram_dq   (sdram_dq),
+        .sdram_dqm  (sdram_dqm),
+        .sdram_clk  (sdram_clk_int),
+        .sdram_cke  (sdram_cke),
+        .sdram_cs_n (sdram_cs_n),
+        .sdram_ras_n(sdram_ras_n),
+        .sdram_cas_n(sdram_cas_n),
+        .sdram_we_n (sdram_we_n)
+    );
+
+    // Forward the SDRAM clock through an ODDR (phase-aligned, verified in the
+    // smoke test). sdram_clk_int carries no data — the command/data pins are
+    // registered to clk and captured by the SDRAM on this forwarded clock.
+    ODDRX1F sdram_clk_oddr (
+        .SCLK (clk),
+        .RST  (1'b0),
+        .D0   (1'b0),
+        .D1   (1'b1),
+        .Q    (sdram_clk)
+    );
+    wire _unused_sclk = sdram_clk_int;
+
     // Core input muxes - the whole internal-slave trick. own_space decode is
     // glitch-safe: the 68000 holds the address stable from before AS to after
     // AS, and sd_configured/base_sd/cfgout_n only change at cycle boundaries
@@ -263,24 +357,42 @@ module base64_top (
     // is invisible at 7 MHz bus pace: worst case DTACK is recognised one
     // master clock later, i.e. the same category of delay as the existing
     // 2FF synchronisers, and slaves hold DTACK until AS ends anyway.
-    wire own_space = ac_access | sd_space;
+    wire own_space = ac_access | sd_space | fm_space | fm_ac_access;
 
-    reg        core_dtack_n;
-    reg [15:0] core_iedb;
+    // DTACK / iEdb mux.
+    //
+    // Most sources are registered here for timing closure. The FASTMEM memory
+    // path is the exception: fm_dtack_n and fm_dout are ALREADY stable,
+    // mutually-aligned registered outputs of the bridge FSM, so we route them
+    // COMBINATIONALLY into the core (bypassing this mux register). That removes
+    // one clock of latency from ack->core, which at 7 MHz is the difference
+    // between hitting and missing the 68000's S4 DTACK sample point (i.e. one
+    // wait state per fastmem access). Because both DTACK and data bypass
+    // together, they stay aligned - no risk of sampling DTACK with stale data.
+    //
+    // reg-path result (for all non-fastmem-memory sources)
+    reg        core_dtack_r;
+    reg [15:0] core_iedb_r;
     reg        core_vpa_n, core_berr_n;
     always @(posedge clk) begin
-        core_dtack_n <= ac_access ? ac_dtack_n :
-                        sd_space  ? sd_dtack_n :
-                                    s_dtack_n[1];
+        core_dtack_r <= ac_access    ? ac_dtack_n    :
+                        sd_space     ? sd_dtack_n    :
+                        fm_ac_access ? fm_ac_dtack_n :
+                                       s_dtack_n[1];
 
-        core_iedb    <= ac_oe                 ? {ac_dout, 12'hFFF} :
-                        (sd_space && core_rw) ? sd_dout            :
+        core_iedb_r  <= ac_oe                 ? {ac_dout, 12'hFFF}    :
+                        fm_ac_oe              ? {fm_ac_dout, 12'hFFF} :
+                        (sd_space && core_rw) ? sd_dout               :
                                                 cpu_d;
 
-        // Never let external VPA/BERR terminate an internal cycle.
         core_vpa_n   <= own_space ? 1'b1 : s_vpa_n[1];
         core_berr_n  <= own_space ? 1'b1 : s_berr_n[1];
     end
+
+    // Combinational final mux: fastmem memory path wins and bypasses the
+    // register above; everything else uses the registered result.
+    wire        core_dtack_n = fm_space ? fm_dtack_n : core_dtack_r;
+    wire [15:0] core_iedb    = (fm_space && core_rw) ? fm_dout : core_iedb_r;
 
     fx68k cpu (
         .clk      (clk),
@@ -378,7 +490,27 @@ module base64_top (
     // Autoconfig chain: CFGOUT asserts once our board is configured or shut
     // up (registered at end-of-cycle inside the shell), then downstream
     // boards see their CFGIN. Replaces the old transparent pass-through.
-    assign cfgout_n = cfgout_int_n;
+    assign cfgout_n = fm_cfgout_n;
+
+    // ------------------------------------------------------------------
+    // Debug observation for Reveal: the autoconfig chain handoff. These are
+    // plain wires (no logic cost beyond routing) so an inserted Reveal core
+    // can sample the exact moment SD hands CFGOUT to fastmem and whether
+    // fastmem then decodes its autoconfig space. Sample on `clk`.
+    //   dbg_sd_cfgout_n  : SD device CFGOUT (fastmem's CFGIN)  0=asserted
+    //   dbg_fm_cfgout_n  : fastmem CFGOUT (chain out)          0=asserted
+    //   dbg_fm_ac_access : fastmem sees its autoconfig cycle
+    //   dbg_fm_configured: fastmem latched a base address
+    //   dbg_fm_state     : fastmem autoconfig state (offer 8/4/2/1/split/done)
+    //   dbg_fm_addr_match: which 1MB slots fastmem claims
+    // ------------------------------------------------------------------
+    (* syn_keep=1 *) wire       dbg_sd_cfgout_n   = cfgout_int_n;
+    (* syn_keep=1 *) wire       dbg_fm_cfgout_n   = fm_cfgout_n;
+    (* syn_keep=1 *) wire       dbg_fm_ac_access  = fastmem.ac_access;
+    (* syn_keep=1 *) wire       dbg_fm_configured = fastmem.configured;
+    (* syn_keep=1 *) wire [2:0] dbg_fm_state      = fastmem.ac_state;
+    (* syn_keep=1 *) wire [7:0] dbg_fm_addr_match = fastmem.addr_match;
+    (* syn_keep=1 *) wire       dbg_fm_cfgin_n    = fm_cfgin_n;
 
     // ------------------------------------------------------------------
     // CBT switches: connect the bus only once locked & powered up. Until the
@@ -394,8 +526,18 @@ module base64_top (
     // the OE pins are glitch-free; the one-clock lag is the safe order on
     // both edges (pins tristate before the switch opens; the switch closes
     // before the core can start its next cycle).
+    // CBT isolation: open the switchable buffers (isolate from the mother-
+    // board) when the bus is granted to a DMA master (drv_bus low) OR when we
+    // are running an internal fastmem cycle (fm_active). These two conditions
+    // are mutually exclusive - a DMA master holding the bus generates its own
+    // cycles, so there is no CPU fastmem cycle then - so they compose with a
+    // simple OR. Isolating fastmem cycles keeps pure CPU<->SDRAM traffic off
+    // the 7 MHz bus, which is what lets it run decoupled/fast.
+    // Registered so OE pins are glitch-free; the one-clock lag is safe on both
+    // edges (pins tristate before switches open; switches close before the
+    // core starts its next cycle).
     reg bus_enable = 1'b0;
-    always @(posedge clk) bus_enable <= pwrup_done & drv_bus;
+    always @(posedge clk) bus_enable <= pwrup_done & drv_bus & ~fm_active;
     assign cbt_oe_d0_7_n   = ~bus_enable;
     assign cbt_oe_d8_15_n  = ~bus_enable;
     assign cbt_oe_ctl_hi_n = ~bus_enable;
@@ -405,11 +547,8 @@ module base64_top (
     // ------------------------------------------------------------------
     // Idle module resources (SDRAM/uart still unused in compat mode)
     // ------------------------------------------------------------------
-    assign sdram_a = 13'd0;  assign sdram_ba = 2'd0;
-    assign sdram_dq = 16'bz; assign sdram_dqm = 2'b11;
-    assign sdram_clk = 1'b0; assign sdram_cke = 1'b0;
-    assign sdram_ras_n = 1'b1; assign sdram_cas_n = 1'b1;
-    assign sdram_we_n = 1'b1;  assign sdram_cs_n = 1'b1;
+    // SDRAM pins are now driven by the sdram_ctrl instance above (fast RAM).
+    // uart still idled.
     assign uart_tx = 1'b1;
 
     // ------------------------------------------------------------------
@@ -426,16 +565,18 @@ module base64_top (
     assign sd_miso_w = sd_d[0];
 
     // ------------------------------------------------------------------
-    // Status LEDs (active low): green pulses with E (core running),
-    // red on while held in reset, blue = bus isolated.
+    // Status LEDs. This board's RGB LED is ACTIVE-HIGH (drive 1 to light, 0 to
+    // turn off) - verified empirically on hardware. Ports are named led_r/g/b
+    // (no "_n") to reflect this. green pulses with E (core running), red on
+    // while held in reset, blue = bus isolated.
     // ------------------------------------------------------------------
     reg [20:0] e_div;
     reg e_d;
     always @(posedge clk) e_d <= core_e;
     always @(posedge clk) if (core_e & ~e_d) e_div <= e_div + 21'd1;
-    assign led_g_n = ~e_div[20];
-    assign led_r_n = ~ext_reset;      // lit while in reset
-    assign led_b_n =  bus_enable;     // lit while isolated (incl. during DMA grants)
+    assign led_g = e_div[20];       // green heartbeat (core running)
+    assign led_r = ext_reset;       // lit while in reset
+    assign led_b = bus_enable;      // lit while isolated (incl. during DMA grants)
 
     // ------------------------------------------------------------------
     // Phase 3b (not yet enabled): flash_preload streams the driver ROM from

@@ -32,3 +32,10 @@ prj/*/*.dir/*
 prj/*/.recovery
 *.svf
 *.trc
+
+# Synplify report files (not covered above)
+*.srr
+*.srf
+*.srp
+*.srm
+prj/*/*_impl1/
