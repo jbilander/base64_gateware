@@ -1,0 +1,65 @@
+# ============================================================================
+# base64_sdram_smoke.lpf — constraints for the standalone SDRAM smoke test.
+# Only clk_12x, the RGB LED, and the SDRAM pins are needed. Copy the SDRAM
+# block verbatim from your existing base64.lpf (reproduced here for a
+# self-contained smoke-test project).
+# ============================================================================
+
+BLOCK RESETPATHS;
+BLOCK ASYNCPATHS;
+
+# ---- Master clock ----
+LOCATE COMP "clk_12x" SITE "L1";
+IOBUF  PORT "clk_12x" IO_TYPE=LVCMOS33 PULLMODE=NONE;
+FREQUENCY PORT "clk_12x" 86.00 MHz;
+
+# ---- RGB LED (common anode, drive LOW to light) ----
+LOCATE COMP "led_r_n" SITE "B11";
+LOCATE COMP "led_g_n" SITE "A11";
+LOCATE COMP "led_b_n" SITE "A12";
+IOBUF PORT "led_r_n" IO_TYPE=LVCMOS33;
+IOBUF PORT "led_g_n" IO_TYPE=LVCMOS33;
+IOBUF PORT "led_b_n" IO_TYPE=LVCMOS33;
+
+# ---- On-module SDRAM: IS42S16160B (16M x 16, 32 MB) ----
+LOCATE COMP "sdram_a[0]" SITE "H15";
+LOCATE COMP "sdram_a[1]" SITE "B13";
+LOCATE COMP "sdram_a[2]" SITE "B12";
+LOCATE COMP "sdram_a[3]" SITE "J16";
+LOCATE COMP "sdram_a[4]" SITE "J15";
+LOCATE COMP "sdram_a[5]" SITE "R12";
+LOCATE COMP "sdram_a[6]" SITE "K16";
+LOCATE COMP "sdram_a[7]" SITE "R13";
+LOCATE COMP "sdram_a[8]" SITE "T13";
+LOCATE COMP "sdram_a[9]" SITE "K15";
+LOCATE COMP "sdram_a[10]" SITE "A13";
+LOCATE COMP "sdram_a[11]" SITE "R14";
+LOCATE COMP "sdram_a[12]" SITE "T14";
+LOCATE COMP "sdram_ba[0]" SITE "G15";
+LOCATE COMP "sdram_ba[1]" SITE "B14";
+LOCATE COMP "sdram_dq[0]" SITE "F16";
+LOCATE COMP "sdram_dq[1]" SITE "E15";
+LOCATE COMP "sdram_dq[2]" SITE "F15";
+LOCATE COMP "sdram_dq[3]" SITE "D14";
+LOCATE COMP "sdram_dq[4]" SITE "E16";
+LOCATE COMP "sdram_dq[5]" SITE "C15";
+LOCATE COMP "sdram_dq[6]" SITE "D16";
+LOCATE COMP "sdram_dq[7]" SITE "B15";
+LOCATE COMP "sdram_dq[8]" SITE "R16";
+LOCATE COMP "sdram_dq[9]" SITE "P16";
+LOCATE COMP "sdram_dq[10]" SITE "P15";
+LOCATE COMP "sdram_dq[11]" SITE "N16";
+LOCATE COMP "sdram_dq[12]" SITE "N14";
+LOCATE COMP "sdram_dq[13]" SITE "M16";
+LOCATE COMP "sdram_dq[14]" SITE "M15";
+LOCATE COMP "sdram_dq[15]" SITE "L15";
+LOCATE COMP "sdram_dqm[0]" SITE "C16";
+LOCATE COMP "sdram_dqm[1]" SITE "T15";
+LOCATE COMP "sdram_clk" SITE "R15";
+LOCATE COMP "sdram_cke" SITE "L16";
+LOCATE COMP "sdram_ras_n" SITE "B16";
+LOCATE COMP "sdram_cas_n" SITE "G16";
+LOCATE COMP "sdram_we_n" SITE "A15";
+LOCATE COMP "sdram_cs_n" SITE "A14";
+DEFINE PORT GROUP "SDRAM_G" "sdram_*";
+IOBUF GROUP "SDRAM_G" IO_TYPE=LVCMOS33 PULLMODE=NONE DRIVE=8 SLEWRATE=FAST;

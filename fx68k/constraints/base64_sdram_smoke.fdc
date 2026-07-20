@@ -1,0 +1,4 @@
+# base64_sdram_smoke.fdc — timing constraint for the SDRAM smoke test.
+# Add this file to the Diamond project (Synplify Design Constraints / .fdc).
+# Without it, Synplify infers a bogus 200 MHz on clk_12x and PAR fails timing.
+create_clock -name {clk_12x} -period 11.75 [get_ports {clk_12x}]
