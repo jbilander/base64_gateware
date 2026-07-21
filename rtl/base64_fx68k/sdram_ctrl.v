@@ -45,6 +45,7 @@ module sdram_ctrl #(
     // ---- CPU-side request/ack handshake (UNCHANGED) ----
     input  wire        req,
     input  wire        we,
+    input  wire        wr_valid,     // 1 = wdata/byte_en are valid (gate WRITE)
     input  wire [23:0] addr,          // word address {row[12:0],bank[1:0],col[8:0]}
     input  wire [15:0] wdata,
     input  wire [1:0]  byte_en,
@@ -125,18 +126,16 @@ module sdram_ctrl #(
                S_RD_DONE   = 4'd10,
                S_WR_DONE   = 4'd11,
                S_REF_PRE   = 4'd12,  // precharge-all before refresh
-               S_REFRESH   = 4'd13;
+               S_REFRESH   = 4'd13,
+               S_ACK_WAIT  = 4'd14;  // hold after ack until req deasserts
 
     reg [3:0]  state;
     reg [3:0]  timer;
-    reg        rd_pending;
     reg        init_done;
     reg [1:0]  cur_bank;
     reg [12:0] cur_row;
     reg [8:0]  cur_col;
     reg        cur_we;
-    reg [15:0] cur_wdata;
-    reg [1:0]  cur_be;
 
     assign ready = init_done;
 
@@ -158,7 +157,6 @@ module sdram_ctrl #(
             timer       <= 4'd0;
             refresh_timer <= 11'd0;
             refresh_due <= 1'b0;
-            rd_pending  <= 1'b0;
             init_done   <= 1'b0;
             row_open    <= 4'b0000;
             for (b=0;b<4;b=b+1) begin open_row[b] <= 13'd0; ras_timer[b] <= 4'd0; end
@@ -242,14 +240,17 @@ module sdram_ctrl #(
                         state <= S_REFRESH;
                     end
                 end else if (req) begin
-                    // latch the request
+                    // latch the request. Only the ADDRESS and direction are
+                    // captured here. Write DATA is NOT latched - it is sampled
+                    // live at the WRITE command, which is gated on wr_valid.
+                    // This lets a write request start early (address valid at
+                    // AS) before the 68000 has driven the data (DS asserts a
+                    // period later on writes). cur_we is the single source of
+                    // truth for read vs write in S_RW.
                     cur_bank  <= a_bank;
                     cur_row   <= a_row;
                     cur_col   <= a_col;
                     cur_we    <= we;
-                    cur_wdata <= wdata;
-                    cur_be    <= byte_en;
-                    rd_pending<= ~we;
                     // open-row decision
                     if (row_open[a_bank] && open_row[a_bank] == a_row) begin
                         // HIT: row already open, go straight to R/W (no tRCD)
@@ -302,22 +303,32 @@ module sdram_ctrl #(
             S_RW: begin
                 if (timer != 0) begin
                     timer <= timer - 1'b1;      // finishing tRCD after activate
-                end else begin
+                end else if (!cur_we) begin
+                    // READ: issue immediately (row is open/active)
                     sdram_ba <= cur_bank;
                     sdram_a  <= {4'b0000, cur_col};   // A10=0: NO auto-precharge
-                    if (rd_pending) begin
-                        set_cmd(CMD_READ);
-                        sdram_dqm <= 2'b00;
-                        timer <= CAS_LAT[3:0];
-                        state <= S_RD_WAIT;
-                    end else begin
-                        set_cmd(CMD_WRITE);
-                        sdram_dqm <= ~cur_be;
-                        dq_out    <= cur_wdata;
-                        dq_oe     <= 1'b1;
-                        state     <= S_WR_DONE;
-                    end
+                    set_cmd(CMD_READ);
+                    sdram_dqm <= 2'b00;
+                    timer <= CAS_LAT[3:0];
+                    state <= S_RD_WAIT;
+                end else if (wr_valid) begin
+                    // WRITE: the row is already active (possibly started early
+                    // at AS). Issue the WRITE only once the data is valid
+                    // (wr_valid). Sample wdata/byte_en LIVE here - by now the
+                    // 68000 has driven them. This is what removes the write
+                    // wait state: the activate overlapped the CPU's data-drive
+                    // delay instead of starting after it.
+                    sdram_ba <= cur_bank;
+                    sdram_a  <= {4'b0000, cur_col};   // A10=0: NO auto-precharge
+                    set_cmd(CMD_WRITE);
+                    sdram_dqm <= ~byte_en;
+                    dq_out    <= wdata;
+                    dq_oe     <= 1'b1;
+                    state     <= S_WR_DONE;
                 end
+                // else (write, data not yet valid): hold here with row open,
+                // waiting for wr_valid. No command issued (NOP), no timeout -
+                // the CPU will assert data strobes within a couple of clocks.
             end
             S_RD_WAIT: begin
                 if (timer > 1) timer <= timer - 1'b1;
@@ -326,11 +337,18 @@ module sdram_ctrl #(
             S_RD_DONE: begin
                 rdata <= sdram_dq;
                 ack   <= 1'b1;
-                state <= S_IDLE;               // row stays OPEN
+                state <= S_ACK_WAIT;          // row stays OPEN; wait req low
+            end
+            // Wait for the requester to drop req before accepting a new access.
+            // Prevents a lingering req (deasserted a cycle after ack) from being
+            // re-accepted with stale cur_we/data - which would hang a following
+            // read behind a phantom write, or vice versa.
+            S_ACK_WAIT: begin
+                if (!req) state <= S_IDLE;
             end
             S_WR_DONE: begin
                 ack   <= 1'b1;
-                state <= S_IDLE;               // row stays OPEN
+                state <= S_ACK_WAIT;          // row stays OPEN; wait req low
             end
             // ---------------- REFRESH ----------------
             S_REF_PRE: begin

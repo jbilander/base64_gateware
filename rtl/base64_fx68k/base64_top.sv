@@ -267,6 +267,7 @@ module base64_top (
     wire [23:0] sd_saddr;
     wire [15:0] sd_wdata, sd_rdata;
     wire [1:0]  sd_byte_en;
+    wire        sd_wr_valid;
     // internal SDRAM clock (forwarded to the pin via ODDR below)
     wire        sdram_clk_int;
 
@@ -303,6 +304,7 @@ module base64_top (
         .saddr      (sd_saddr),
         .wdata      (sd_wdata),
         .byte_en    (sd_byte_en),
+        .wr_valid   (sd_wr_valid),
         .ack        (sd_ack),
         .rdata      (sd_rdata),
         .sdram_ready(sdram_ready)
@@ -315,6 +317,7 @@ module base64_top (
         .reset      (devices_reset),
         .req        (sd_req),
         .we         (sd_we),
+        .wr_valid   (sd_wr_valid),
         .addr       (sd_saddr),
         .wdata      (sd_wdata),
         .byte_en    (sd_byte_en),
@@ -493,24 +496,100 @@ module base64_top (
     assign cfgout_n = fm_cfgout_n;
 
     // ------------------------------------------------------------------
-    // Debug observation for Reveal: the autoconfig chain handoff. These are
-    // plain wires (no logic cost beyond routing) so an inserted Reveal core
-    // can sample the exact moment SD hands CFGOUT to fastmem and whether
-    // fastmem then decodes its autoconfig space. Sample on `clk`.
-    //   dbg_sd_cfgout_n  : SD device CFGOUT (fastmem's CFGIN)  0=asserted
-    //   dbg_fm_cfgout_n  : fastmem CFGOUT (chain out)          0=asserted
-    //   dbg_fm_ac_access : fastmem sees its autoconfig cycle
-    //   dbg_fm_configured: fastmem latched a base address
-    //   dbg_fm_state     : fastmem autoconfig state (offer 8/4/2/1/split/done)
-    //   dbg_fm_addr_match: which 1MB slots fastmem claims
+    // Fastmem cycle-length MEASUREMENT (LED debug, no JTAG needed).
+    //
+    // Instead of an absolute AS->DTACK count (whose calibration depends on the
+    // exact fx68k phase alignment), we measure the FULL fastmem read cycle
+    // length: the number of master clocks AS stays low, from AS-fall to
+    // AS-rise. This maps directly to wait states:
+    //   a 68000 read with no wait states = 4 CPU-clock periods = 48 master
+    //   clocks (at 12x); each wait state adds 2 states = 1 CPU period = 12
+    //   master clocks. We report the count in CPU-CLOCK PERIODS (master/12) so
+    //   the LED shows a small number:  4 = zero wait state (ideal, matches
+    //   SRAM), 5 = one wait state (our current case), etc.
+    //
+    // Display: GREEN blinks the period-count, long pause, repeat. Count the
+    // blinks. 4 blinks = zero wait; 5 blinks = one wait state; and so on.
+    // We latch the MODE-ish value by tracking the MINIMUM full-read length seen
+    // (the best/steady-state open-row-hit case), since occasional misses or
+    // refresh collisions lengthen individual cycles but the fast repeated value
+    // is the one that governs the Dhrystone score.
     // ------------------------------------------------------------------
-    (* syn_keep=1 *) wire       dbg_sd_cfgout_n   = cfgout_int_n;
-    (* syn_keep=1 *) wire       dbg_fm_cfgout_n   = fm_cfgout_n;
-    (* syn_keep=1 *) wire       dbg_fm_ac_access  = fastmem.ac_access;
-    (* syn_keep=1 *) wire       dbg_fm_configured = fastmem.configured;
-    (* syn_keep=1 *) wire [2:0] dbg_fm_state      = fastmem.ac_state;
-    (* syn_keep=1 *) wire [7:0] dbg_fm_addr_match = fastmem.addr_match;
-    (* syn_keep=1 *) wire       dbg_fm_cfgin_n    = fm_cfgin_n;
+    localparam LAT_DEBUG     = 1'b0;   // 1 = LEDs blink measured cycle length
+    localparam MEASURE_WRITES = 1'b1;  // 1 = measure WRITE cycles, 0 = reads
+    wire meas_dir = MEASURE_WRITES ? ~core_rw : core_rw;
+
+    reg        fm_rd_active;
+    reg [11:0] len_ctr;          // master-clock count of AS-low this cycle
+    reg [11:0] len_min;          // latched best (shortest) full-read length
+    reg        as_n_d;
+    reg        cyc_is_fm_rd;     // this AS-low cycle is a fastmem read
+    always @(posedge clk) as_n_d <= core_as_n;
+    wire as_fall = ~core_as_n & as_n_d;
+    wire as_rise =  core_as_n & ~as_n_d;
+
+    always @(posedge clk) begin
+        if (devices_reset) begin
+            fm_rd_active <= 1'b0;
+            len_ctr      <= 12'd0;
+            len_min      <= 12'hFFF;      // start high; min will drop
+            cyc_is_fm_rd <= 1'b0;
+        end else begin
+            if (as_fall) begin
+                // a new bus cycle starts; is it a fastmem read?
+                cyc_is_fm_rd <= fm_space & meas_dir;
+                fm_rd_active <= fm_space & meas_dir;
+                len_ctr      <= 12'd1;
+            end else if (fm_rd_active) begin
+                if (as_rise) begin
+                    // cycle ended: len_ctr = master clocks AS was low
+                    if (len_ctr < len_min) len_min <= len_ctr;
+                    fm_rd_active <= 1'b0;
+                end else if (len_ctr != 12'hFFF) begin
+                    len_ctr <= len_ctr + 12'd1;
+                end
+            end
+        end
+    end
+
+    // Convert min master-clock length to CPU-clock PERIODS (divide by 12) for a
+    // small, human-countable number. Round to nearest.
+    wire [7:0] len_periods = (len_min + 12'd6) / 12'd12;
+
+    // Blink len_periods on green: N blinks, pause, repeat.
+    reg [23:0] blink_div;
+    reg [3:0]  blink_phase;
+    reg        blink_on;
+    reg        in_pause;
+    reg [25:0] pause_div;
+    always @(posedge clk) begin
+        if (devices_reset) begin
+            blink_div <= 24'd0; blink_phase <= 4'd0; blink_on <= 1'b0;
+            in_pause <= 1'b1; pause_div <= 26'd0;
+        end else if (in_pause) begin
+            blink_on <= 1'b0;
+            pause_div <= pause_div + 26'd1;
+            if (pause_div[25]) begin
+                pause_div <= 26'd0;
+                in_pause  <= 1'b0;
+                blink_phase <= 4'd0;
+                blink_div <= 24'd0;
+            end
+        end else begin
+            blink_div <= blink_div + 24'd1;
+            if (blink_div == 24'hFFFFFF) begin
+                blink_on <= ~blink_on;
+                if (~blink_on) begin
+                    // transitioning off->on: about to start a blink
+                end else begin
+                    // on->off transition completes one blink
+                    blink_phase <= blink_phase + 4'd1;
+                    if (blink_phase + 4'd1 >= len_periods[3:0])
+                        in_pause <= 1'b1;
+                end
+            end
+        end
+    end
 
     // ------------------------------------------------------------------
     // CBT switches: connect the bus only once locked & powered up. Until the
@@ -574,9 +653,11 @@ module base64_top (
     reg e_d;
     always @(posedge clk) e_d <= core_e;
     always @(posedge clk) if (core_e & ~e_d) e_div <= e_div + 21'd1;
-    assign led_g = e_div[20];       // green heartbeat (core running)
-    assign led_r = ext_reset;       // lit while in reset
-    assign led_b = bus_enable;      // lit while isolated (incl. during DMA grants)
+    // Normal status LEDs, overridden by the latency-blink display when
+    // LAT_DEBUG is set (green blinks the measured fastmem read latency).
+    assign led_g = LAT_DEBUG ? blink_on       : e_div[20];   // green: blink count = latency, or heartbeat
+    assign led_r = LAT_DEBUG ? 1'b0           : ext_reset;   // red off in debug
+    assign led_b = LAT_DEBUG ? 1'b0           : bus_enable;  // blue off in debug
 
     // ------------------------------------------------------------------
     // Phase 3b (not yet enabled): flash_preload streams the driver ROM from

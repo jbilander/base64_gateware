@@ -61,8 +61,9 @@ module fastmem_zii #(
     output reg         req,
     output reg         we,
     output reg  [23:0] saddr,        // SDRAM word address
-    output reg  [15:0] wdata,
-    output reg  [1:0]  byte_en,
+    output wire [15:0] wdata,
+    output wire [1:0]  byte_en,
+    output wire        wr_valid,     // write data valid (data strobes asserted)
     input  wire        ack,
     input  wire [15:0] rdata,
     input  wire        sdram_ready
@@ -274,48 +275,86 @@ wire [3:0] dense_mb = popcount_below(addr_match, slot);   // which MB in SDRAM
 wire [23:0] sdram_word = {1'b0, dense_mb, a[19:1]};
 
 // ---------------------------------------------------------------------------
-// Bus <-> controller bridge FSM (complete within one 68000 cycle)
+// Bus <-> controller bridge FSM.
+//
+// Zero-wait-state timing: fm_dtack_n and fm_dout are presented COMBINATIONALLY
+// the same cycle the SDRAM ack arrives (and held for the rest of the CPU cycle
+// by fm_hold / fm_dout_r). This shaves the last registration clock between the
+// SDRAM answering and the core seeing DTACK+data. It is safe because:
+//  * data (rdata) and DTACK are asserted together in the same cycle, so the
+//    core never latches DTACK with stale data;
+//  * the top routes fm_dtack_n/fm_dout combinationally into the core only when
+//    fm_space is asserted, so there is no effect outside our own cycles;
+//  * fm_hold latches the completion so DTACK stays valid from the ack cycle
+//    until the CPU raises AS, regardless of ack being a single pulse.
 // ---------------------------------------------------------------------------
 localparam B_IDLE = 2'd0,
            B_REQ  = 2'd1,
            B_DONE = 2'd2;
-reg [1:0] bstate;
+reg [1:0]  bstate;
+
+// Write data, byte-enables, and wr_valid are driven COMBINATIONALLY from the
+// live bus. The controller samples wdata/byte_en at the actual WRITE command
+// (gated on wr_valid), by which time the 68000 has driven the data and asserted
+// the data strobes - even though the request started earlier at AS time. On
+// reads these are don't-care. wr_valid = data strobes asserted.
+assign wdata    = d_in;
+assign byte_en  = ~{uds_n, lds_n};
+assign wr_valid = ~ds_n;
+
+// Write data and byte-enables are driven COMBINATIONALLY from the live bus.
+// The SDRAM controller samples them at the actual WRITE command (after the row
+// activate), by which time the CPU has driven the data and asserted the data
+// strobes - even though we started the request earlier at AS time. On reads
+// these are don't-care.
+reg        fm_hold;          // completion latched until AS rises
+reg [15:0] fm_dout_r;        // captured read data (held after ack)
+
+// Combinational outputs: assert the moment ack is seen, or while held.
+wire ack_now = (bstate == B_REQ) && ack;
+always @(*) begin
+    fm_dtack_n = ~(ack_now | fm_hold);
+    fm_dout    = ack_now ? rdata : fm_dout_r;
+end
 
 always @(posedge clk) begin
     if (reset) begin
-        bstate     <= B_IDLE;
-        req        <= 1'b0;
-        we         <= 1'b0;
-        fm_dtack_n <= 1'b1;
-        fm_dout    <= 16'd0;
+        bstate    <= B_IDLE;
+        req       <= 1'b0;
+        we        <= 1'b0;
+        fm_hold   <= 1'b0;
+        fm_dout_r <= 16'd0;
     end else begin
         case (bstate)
         B_IDLE: begin
-            fm_dtack_n <= 1'b1;
-            req        <= 1'b0;
-            // start when our space is selected and data strobes are valid
-            if (fm_space && !ds_n && sdram_ready) begin
-                saddr   <= sdram_word;
-                we      <= ~rw;
-                wdata   <= d_in;
-                byte_en <= ~{uds_n, lds_n};   // uds->high byte, lds->low byte
-                req     <= 1'b1;
-                bstate  <= B_REQ;
+            fm_hold <= 1'b0;
+            req     <= 1'b0;
+            // Reads start when DS is valid (on a 68000 read, DS asserts with
+            // AS, so this is effectively immediate). WRITES start as soon as
+            // the cycle is decoded as ours - at AS time, WITHOUT waiting for
+            // DS - because the 68000 asserts DS (and drives data) one CPU
+            // period LATER on writes. Starting the SDRAM activate early lets it
+            // overlap that delay; the controller holds off the actual WRITE
+            // command until wr_valid. This removes the write wait state.
+            if (fm_space && sdram_ready && ((rw && !ds_n) || (!rw))) begin
+                saddr  <= sdram_word;
+                we     <= ~rw;
+                req    <= 1'b1;
+                bstate <= B_REQ;
             end
         end
         B_REQ: begin
             if (ack) begin
-                req    <= 1'b0;
-                if (rw) fm_dout <= rdata;
-                fm_dtack_n <= 1'b0;            // terminate the CPU cycle
-                bstate <= B_DONE;
+                req       <= 1'b0;
+                fm_dout_r <= rdata;       // hold data after the ack pulse
+                fm_hold   <= 1'b1;        // hold DTACK asserted
+                bstate    <= B_DONE;
             end
         end
         B_DONE: begin
-            // hold DTACK asserted until the CPU ends the cycle (AS high)
             if (as_n) begin
-                fm_dtack_n <= 1'b1;
-                bstate     <= B_IDLE;
+                fm_hold <= 1'b0;
+                bstate  <= B_IDLE;
             end
         end
         default: bstate <= B_IDLE;
