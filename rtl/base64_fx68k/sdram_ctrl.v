@@ -50,6 +50,16 @@ module sdram_ctrl #(
     input  wire [15:0] wdata,
     input  wire [1:0]  byte_en,
     output reg         ack,
+    // Combinational ack, asserted in the SAME cycle the CAS data lands on dq
+    // rather than the cycle after. Worth one master clock, which is exactly
+    // what separates one wait state from none at 6x.
+    //
+    // This is NOT the unsafe "EARLY_ACK" that green-screened the machine.
+    // That acked on the MOTHERBOARD's DTACK, before the slave had driven
+    // data. Here the data is demonstrably on dq -- we are sampling it on this
+    // very edge -- so the value handed over is real.
+    output wire        ack_early,
+    output wire [15:0] rdata_live,
     output reg  [15:0] rdata,
     output wire        ready,
 
@@ -79,6 +89,9 @@ module sdram_ctrl #(
     assign sdram_dq = dq_oe ? dq_out : 16'bz;
 
     // ---- commands {cs,ras,cas,we} ----
+    assign ack_early  = (state == S_RD_DONE) || (state == S_WR_DONE);
+    assign rdata_live = sdram_dq;
+
     localparam CMD_NOP      = 4'b0111;
     localparam CMD_ACTIVE   = 4'b0011;
     localparam CMD_READ     = 4'b0101;
@@ -108,6 +121,10 @@ module sdram_ctrl #(
     reg        refresh_due;
 
     // ---- open-row tracking: one open row + valid flag per bank ----
+    // Refresh deferral: bounded so refresh can never actually be starved.
+    localparam [7:0] REF_DEFER = 8'd64;
+    reg  [7:0] ref_defer = 8'd0;
+    wire       ref_urgent = (ref_defer >= REF_DEFER);
     reg [12:0] open_row [0:3];
     reg [3:0]  row_open;          // bit b = bank b has an open row
     reg [3:0]  ras_timer [0:3];   // per-bank tRAS since activate (saturating)
@@ -175,9 +192,21 @@ module sdram_ctrl #(
             end
 
             // saturating per-bank tRAS counters
-            for (b=0;b<4;b=b+1)
+            // NOTE the begin/end. The original for-loop body was a single
+            // statement with no begin/end; inserting the ref_defer lines
+            // above it silently pushed the tRAS counter OUT of the loop,
+            // where b holds its terminal value 4 -- out of range for both
+            // row_open[3:0] and ras_timer[0:3]. ras_timer then never
+            // incremented, so "ras_timer[a_bank] >= T_RAS" was never true and
+            // every row miss on an already-open bank stalled in S_IDLE until
+            // the next refresh cleared row_open. That is the 2992 -> 1354
+            // regression: not timing, a missing begin/end.
+            for (b=0;b<4;b=b+1) begin
                 if (row_open[b] && ras_timer[b] != 4'hF)
                     ras_timer[b] <= ras_timer[b] + 4'd1;
+            end
+            if (refresh_due && ref_defer < 8'hFF) ref_defer <= ref_defer + 8'd1;
+            if (!refresh_due)                     ref_defer <= 8'd0;
 
             case (state)
             // ---------------- INIT ----------------
@@ -225,10 +254,24 @@ module sdram_ctrl #(
                 sdram_dqm <= 2'b11;
                 if (timer != 0) begin
                     timer <= timer - 1'b1;
-                end else if (refresh_due) begin
+                end else if (refresh_due && (!req || ref_urgent)) begin
+                    // A pending CPU access now takes priority over refresh.
+                    // Previously refresh_due was tested BEFORE req, so a
+                    // refresh falling due while the 68000 was mid-cycle
+                    // inserted precharge-all + tRFC + a guaranteed row miss
+                    // into that cycle -- the source of the 22-CPU-clock
+                    // outliers. Refresh has enormous slack (one per 640
+                    // clocks against a 64 ms window), so deferring it by up
+                    // to REF_DEFER clocks costs nothing and is bounded.
                     refresh_due <= 1'b0;
+                    ref_defer   <= 8'd0;
                     // must close all rows before refresh
                     if (row_open != 4'b0000) begin
+                        // NOTE: restoring the evicted row after refresh was
+                        // tried and measured a wash (w2 556->561 but w3/w4
+                        // 514->511), so it is deliberately NOT done. The
+                        // post-refresh miss is cheaper than the extra
+                        // ACTIVATE plus tRCD it would cost.
                         set_cmd(CMD_PRECHG);
                         sdram_a[10] <= 1'b1;         // precharge all
                         row_open <= 4'b0000;
@@ -253,9 +296,21 @@ module sdram_ctrl #(
                     cur_we    <= we;
                     // open-row decision
                     if (row_open[a_bank] && open_row[a_bank] == a_row) begin
-                        // HIT: row already open, go straight to R/W (no tRCD)
+                        // HIT: row already open. OPT B -- issue the READ in
+                        // THIS cycle rather than spending one getting to
+                        // S_RW. Writes still route via S_RW because the
+                        // WRITE command has to wait for wr_valid.
                         timer <= 4'd0;
-                        state <= S_RW;
+                        if (!we) begin
+                            sdram_ba  <= a_bank;
+                            sdram_a   <= {4'b0000, a_col};  // A10=0, no auto-pre
+                            set_cmd(CMD_READ);
+                            sdram_dqm <= 2'b00;
+                            timer     <= CAS_LAT[3:0];
+                            state     <= S_RD_WAIT;
+                        end else begin
+                            state <= S_RW;
+                        end
                     end else if (row_open[a_bank]) begin
                         // wrong row open: precharge it (respect tRAS), then activate
                         if (ras_timer[a_bank] >= T_RAS[3:0]) begin

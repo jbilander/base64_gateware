@@ -58,13 +58,15 @@ module fastmem_zii #(
     output wire        fm_ac_dtack_n,// DTACK for autoconfig cycles
 
     // ---- to sdram_ctrl handshake ----
-    output reg         req,
-    output reg         we,
-    output reg  [23:0] saddr,        // SDRAM word address
+    output wire        req,
+    output wire        we,
+    output wire [23:0] saddr,        // SDRAM word address
     output wire [15:0] wdata,
     output wire [1:0]  byte_en,
     output wire        wr_valid,     // write data valid (data strobes asserted)
     input  wire        ack,
+    input  wire        ack_early,
+    input  wire [15:0] rdata_live,
     input  wire [15:0] rdata,
     input  wire        sdram_ready
 );
@@ -142,6 +144,10 @@ end
 
 // autoconfig read nibble to D15:12 (ac_nib declared above)
 assign fm_ac_dout = ac_nib;
+
+assign req   = fm_req_now || (bstate == B_REQ);
+assign we    = ~rw;
+assign saddr = saddr_r;
 
 // CFGOUT registered at end-of-cycle (rising edge of AS)
 reg as_n_q;
@@ -254,6 +260,33 @@ wire [2:0] slot = region[2:0] - 3'd2;     // 0..7
 wire       owns = in_window && addr_match[slot];
 
 assign fm_space  = owns && !as_n;
+
+// OPT A: combinational request. Reads start when DS is valid (on a 68000 read
+// DS asserts with AS, so effectively immediately); writes start at decode time
+// without waiting for DS, because the 68000 drives write data a CPU period
+// later and the controller gates the actual WRITE command on wr_valid.
+// TIMING-SAFE form of the early request.
+//
+// The first version drove saddr combinationally from the core address. That
+// put core_a -> region decode -> addr_match -> 24-bit sdram_word -> the
+// controller's S_IDLE row compare -> the SDRAM command registers ALL in one
+// 85 MHz clock, and it is what destroyed performance on hardware (2992 ->
+// 1354 Dhrystones) even though simulation showed it faster. Simulation has
+// no delay model; that regression was timing closure, not logic.
+//
+// Instead, sdram_word is tracked into a register every clock. The 68000
+// presents the address at S1, one CPU clock (two master clocks) BEFORE AS,
+// so by the time req asserts the register already holds the right address
+// and the path is a normal one-clock register-to-register hop.
+//
+// we stays combinational because R/W goes low at S2, simultaneously with AS
+// -- a registered copy would still read "read" on a write. It is only ~rw,
+// a trivial path.
+reg [23:0] saddr_r;
+always @(posedge clk) saddr_r <= sdram_word;
+
+wire fm_req_now = fm_space && sdram_ready && (bstate == B_IDLE)
+                  && ((rw && !ds_n) || (!rw));
 assign fm_active = fm_space;              // isolate CBTs on our cycles
 
 // Dense SDRAM packing: count owned slots below `slot` to get the block's base
@@ -311,24 +344,25 @@ reg        fm_hold;          // completion latched until AS rises
 reg [15:0] fm_dout_r;        // captured read data (held after ack)
 
 // Combinational outputs: assert the moment ack is seen, or while held.
-wire ack_now = (bstate == B_REQ) && ack;
+// ack_early fires one clock before ack, in the cycle the CAS data is on dq.
+wire ack_hit  = ack || ack_early;
+wire [15:0] ack_dat = ack_early ? rdata_live : rdata;
+wire ack_now  = (bstate == B_REQ) && ack_hit;
 always @(*) begin
     fm_dtack_n = ~(ack_now | fm_hold);
-    fm_dout    = ack_now ? rdata : fm_dout_r;
+    fm_dout    = ack_now ? ack_dat : fm_dout_r;
 end
 
 always @(posedge clk) begin
     if (reset) begin
         bstate    <= B_IDLE;
-        req       <= 1'b0;
-        we        <= 1'b0;
         fm_hold   <= 1'b0;
         fm_dout_r <= 16'd0;
     end else begin
         case (bstate)
         B_IDLE: begin
             fm_hold <= 1'b0;
-            req     <= 1'b0;
+
             // Reads start when DS is valid (on a 68000 read, DS asserts with
             // AS, so this is effectively immediate). WRITES start as soon as
             // the cycle is decoded as ours - at AS time, WITHOUT waiting for
@@ -336,17 +370,15 @@ always @(posedge clk) begin
             // period LATER on writes. Starting the SDRAM activate early lets it
             // overlap that delay; the controller holds off the actual WRITE
             // command until wr_valid. This removes the write wait state.
-            if (fm_space && sdram_ready && ((rw && !ds_n) || (!rw))) begin
-                saddr  <= sdram_word;
-                we     <= ~rw;
-                req    <= 1'b1;
-                bstate <= B_REQ;
-            end
+            // OPT A: the address and R/W are valid at the core's S1, one CPU
+            // clock BEFORE AS falls, so nothing is gained by spending a clock
+            // registering the decode. req/saddr/we are driven combinationally
+            // from the same terms; only the state advance stays registered.
+            if (fm_req_now) bstate <= B_REQ;
         end
         B_REQ: begin
-            if (ack) begin
-                req       <= 1'b0;
-                fm_dout_r <= rdata;       // hold data after the ack pulse
+            if (ack_hit) begin
+                fm_dout_r <= ack_dat;       // hold data after the ack pulse
                 fm_hold   <= 1'b1;        // hold DTACK asserted
                 bstate    <= B_DONE;
             end

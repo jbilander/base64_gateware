@@ -1,29 +1,174 @@
-# Synplify Pro timing constraints — base64_fx68k, COMPAT mode (7.09 MHz)
-# ---------------------------------------------------------------------------
-# clk_12x is the 85.1 MHz ICS570B clock (x12 of the 7M bus, PLL-locked).
-create_clock -name {clk_12x} -period 11.72 [get_ports {clk_12x}]
-
-# clk_7m sampled as data in the clk_12x domain (2FF), not a real clock domain.
-create_clock -name {clk_7m} -period 141.0 [get_ports {clk_7m}]
-
-# The two are phase-related but we resync with 2FF -> treat as async groups.
-set_clock_groups -asynchronous -group {clk_12x} -group {clk_7m}
-
-# ---------------------------------------------------------------------------
-# COMPAT-MODE MULTICYCLE
-# In compat mode the fx68k core advances only on the phase enables (enPhi1/
-# enPhi2), which fire once every 6 clk_12x cycles. So core-internal register-
-# to-register paths have ~6 cycles to settle, not 1. Without this the tool
-# evaluates them against a single 11.72 ns period and reports false setup
-# failures (the -0.47 ns / 99-path miss on the rIr->microToNanoAddr decode).
+# =====================================================================
+# base64_6x.fdc  --  Synplify Pro constraints for the 6x turbo build
 #
-# Scope: ONLY the fx68k core instance's internal paths (u_* named "cpu").
-# The wrapper's phase generator, 2FF synchronizers, and I/O tristate logic
-# are NOT covered here and remain single-cycle (correct — they run every clk).
+# WHAT CHANGED vs base64.fdc, and why
 #
-# NOTE: verify the instance path prefix matches your netlist. Top instance of
-# fx68k is "cpu" (see base64_top.sv). If Synplify flattens/renames, adjust the
-# get_cells pattern. Multicycle of 6 for setup, 5 for hold (standard N/N-1).
-# ---------------------------------------------------------------------------
-#set_multicycle_path -from [get_cells {cpu.*}] -to [get_cells {cpu.*}] -setup 6
-#set_multicycle_path -from [get_cells {cpu.*}] -to [get_cells {cpu.*}] -hold  5
+#   The old file did:
+#       create_clock -name clk_7m ... -period 141.0
+#       set_clock_groups -asynchronous -group clk_12x -group clk_7m
+#
+#   You objected to that line. You were right, but for a better reason
+#   than "the 570 is phase aligned": in this design clk_7m is not a clock
+#   at all. Nothing is clocked by it. It is sampled as DATA by a 2FF
+#   synchroniser running on clk_12x, and every "7M domain" flop is a
+#   clk_12x flop with a clock enable. There is exactly one clock in the
+#   design. So clk_7m must not be declared with create_clock, and once it
+#   is not declared there is no second group to declare asynchronous --
+#   the set_clock_groups line disappears on its own.
+#
+#   Declaring it as a clock was actively harmful: it made Synplify build a
+#   CDC model for a crossing that does not exist, and the -asynchronous
+#   escape hatch then silently disabled timing analysis on paths that DO
+#   need checking (the bridge's pin registers).
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 1. The one real clock
+# ---------------------------------------------------------------------
+# Constrain to the NTSC period (the faster of the two) so a single
+# bitstream is valid on both machines:
+#     PAL   7.09379 MHz x 12 = 85.126 MHz -> 11.747 ns
+#     NTSC  7.15909 MHz x 12 = 85.909 MHz -> 11.640 ns
+create_clock -name clk_12x -period 11.640 [get_ports clk_12x]
+
+# ---------------------------------------------------------------------
+# 2. clk_7m is DATA, not a clock
+# ---------------------------------------------------------------------
+# It feeds only the first stage of a synchroniser, which is allowed to go
+# metastable by construction. False-path it so the tool does not try to
+# close a setup arc on an input with no defined phase relationship.
+#
+# IMPORTANT -- do not "improve" this by adding a create_clock back. What
+# protects the PHASE_OFS alignment is not this constraint, it is the
+# negedge capture in section 2 of the RTL: the sample point sits 5.82 ns
+# away from the clk_12x rising edge, so several ns of PVT movement on the
+# input path cannot change WHICH master clock captures the 7M edge. That
+# is a design property, not a timing-closure property.
+set_false_path -from [get_ports clk_7m]
+
+# Same argument for every genuinely asynchronous motherboard input: all
+# of them land in a 2FF synchroniser (RTL section 2).
+set_false_path -from [get_ports {cpu_dtack_n cpu_vpa_n cpu_berr_n}]
+set_false_path -from [get_ports {cpu_br_n cpu_bgack_n cpu_reset_n cpu_halt_n}]
+set_false_path -from [get_ports {cpu_ipl_n[*] cpu_cfgin_n}]
+
+# ---------------------------------------------------------------------
+# 3. Bus pins -- the constraint the old file was missing entirely
+# ---------------------------------------------------------------------
+# The bridge drives these from dedicated pin registers. Pack them into
+# the IOBs: that is what keeps skew between address bits (and between
+# address and AS) down to package/route mismatch instead of fabric
+# routing spread. At 7 MHz the absolute delay is irrelevant -- the SKEW
+# is what Gary and the RAM see.
+define_attribute {i:p_a[*]}    {syn_useioff} {1}
+define_attribute {i:p_d[*]}    {syn_useioff} {1}
+define_attribute {i:p_fc[*]}   {syn_useioff} {1}
+define_attribute {i:p_rw}      {syn_useioff} {1}
+define_attribute {i:p_as_n}    {syn_useioff} {1}
+define_attribute {i:p_uds_n}   {syn_useioff} {1}
+define_attribute {i:p_lds_n}   {syn_useioff} {1}
+define_attribute {i:p_vma_n}   {syn_useioff} {1}
+# p_e omitted on purpose: Synplify reported "Cannot apply constraint
+# syn_useioff to p_e" because it had already absorbed the register into
+# the pad. cpu_e arrives in 3.958 ns, so it is already packed.
+
+# DO NOT add set_output_delay here. The first build did, and it was wrong:
+#
+#   set_output_delay -clock clk_12x -max 6.0 [get_ports {cpu_a[*] ...}]
+#
+# That says "the destination samples this relative to clk_12x with 6 ns of
+# setup". Gary does not sample on clk_12x. The constraint is fiction, and
+# it made the tool report 336 setup errors and an Fmax of 79.4 MHz on a
+# design whose logic actually closes 86.9 MHz. Worse, it BURIED the one
+# number that matters -- fx68k's real slack -- under 47 output ports that
+# were never going to meet it.
+#
+# For the record, the measured arrival times with that constraint in place:
+#
+#   cpu_a[*], cpu_as_n, cpu_fc[*], strobes   6.190 ns
+#   cpu_d[*]                                 6.592 ns
+#   cpu_e                                    3.958 ns  (IOB packed, no OE)
+#
+# Every one of those is registered on the same clk_12x edge, so the SKEW is
+# 0 ns across the address bus, 0 ns between address and AS, and 0.4 ns
+# between address and data. On a bus whose period is 141 ns and where AS
+# falls a deliberate 70 ns after the address is valid, that is not a
+# timing problem in any sense that reaches the motherboard.
+#
+# The ~2.2 ns that cpu_a costs over cpu_e is the tri-state enable path
+# (two LUTs) plus the BB buffer with SLEWRATE=SLOW from base64.lpf. The
+# slow slew rate is deliberate -- it is there to keep the edges civil on a
+# long unterminated backplane -- and trading it for timing margin you do
+# not need would be a bad trade.
+#
+# If you ever do want a real output constraint, the honest form is a
+# max-delay to the pin, not a setup relative to a clock the far end has
+# never heard of:
+#
+#   set_max_delay 9.0 -to [get_ports {cpu_a[*] cpu_d[*] cpu_as_n}]
+
+# ---------------------------------------------------------------------
+# 4. fx68k -- READ THIS BEFORE TOUCHING IT
+# ---------------------------------------------------------------------
+# Every fx68k flop is clocked by clk_12x and gated by enPhi1 or enPhi2.
+# STA therefore demands that EVERY path close in one master clock period
+# (11.64 ns) unless you tell it otherwise. The real settling time
+# available depends on which enable is at each end:
+#
+#   at CLK_MULT=12, CPU_MULT=6  (MC4 = 2 master clocks per CPU period)
+#     phi1 -> phi2 :  1 master clock  = 11.64 ns   <-- CANNOT be relaxed
+#     phi2 -> phi1 :  1 master clock  = 11.64 ns   <-- CANNOT be relaxed
+#     phi1 -> phi1 :  2 master clocks = 23.28 ns   <-- multicycle 2
+#     phi2 -> phi2 :  2 master clocks = 23.28 ns   <-- multicycle 2
+#
+# So the hard requirement is that fx68k's phi1->phi2 logic closes at
+# 85.9 MHz. No constraint can buy you out of that, and neither can a
+# faster master clock (see DESIGN_NOTES_6x.md section "Why not 24x").
+#
+# UPDATE -- the first build settled this. Only TWO paths fail, by 0.020 ns
+# and 0.001 ns, and both are legitimately multicycle. From your fork:
+#
+#   enT1 = enPhi1 & tState[T4] & ~wClk
+#   enT2 = enPhi2 & tState[T1]
+#   enT3 = enPhi1 & tState[T2]
+#   enT4 = enPhi2 & (tState[T0] | tState[T3])
+#
+# so the four T slots land phi1,phi2,phi1,phi2 and a full microcycle is
+# 4 master clocks at CPU_MULT=6. The two failing paths are:
+#
+#   rCcrCore_t3 (enT3) -> rPswCcr_t3 (enT3)   T3->T3, a whole microcycle
+#                                             = 4 master clocks = 46.6 ns
+#   oper        (enT4) -> rPswCcr_t3 (enT3)   T4->T3, three T slots
+#                                             = 3 master clocks = 34.9 ns
+#
+# Both are being held to 11.64 ns, i.e. over-constrained by 3-4x. The
+# 0.020 ns "failure" is meaningless. These two are safe to relax, and
+# -setup 2 is deliberately conservative against a real 3-4.
+
+set_multicycle_path -setup 2 -hold 1 \
+    -from [get_cells {cpu/excUnit/U_fx68kAlu/rCcrCore_t3*}] \
+    -to   [get_cells {cpu/excUnit/U_fx68kAlu/rPswCcr_t3*}]
+
+set_multicycle_path -setup 2 -hold 1 \
+    -from [get_cells {cpu/excUnit/U_fx68kAlu/oper*}] \
+    -to   [get_cells {cpu/excUnit/U_fx68kAlu/rPswCcr_t3*}]
+
+# NOTE the -hold 1 companion on each. A -setup N without a matching
+# -hold N-1 moves the hold check to the wrong edge and produces hold
+# violations that look like a routing problem and are not. Hold currently
+# passes with 0 errors -- check it still does after adding these.
+#
+# Do NOT generalise these to a blanket cpu/* form. T1->T2, T2->T3,
+# T3->T4 and T4->T1 really do have only one master clock, and relaxing
+# them would give you a build that passes STA and fails on hardware.
+
+# ---------------------------------------------------------------------
+# 5. Bridge <-> core
+# ---------------------------------------------------------------------
+# These are ordinary single-clock paths and must be analysed normally.
+# Listed here only to make it explicit that they are NOT false paths --
+# the old -asynchronous group would have swallowed them.
+#   bridge FSM  -> pin registers        : real, constrained in section 3
+#   sync flops  -> bridge FSM           : real
+#   bridge      -> core_dtack_lo/rd_data: real, and the tightest of the
+#                                         three because of ACK_LEAD

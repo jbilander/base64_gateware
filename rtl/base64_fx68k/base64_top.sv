@@ -1,37 +1,136 @@
 // ============================================================================
-// base64_top.sv  —  Base64 carrier + iCESugar-Pro, COMPAT MODE (7.09 MHz)
+// base64_top_6x.sv — Base64 carrier + iCESugar-Pro, TURBO MODE (6x = 42.6 MHz)
 //
-// Cycle-exact 68000 replacement. fx68k (upstream ijor) driven by phase
-// enables locked to the motherboard 7M clock via the ICS570B x12 (85.1 MHz).
-// One 68k cycle per 12 master clocks -> effective 7.09/7.16 MHz, indistin-
-// guishable from a stock 68000. Turbo is a later, separate build.
+// fx68k runs at CPU_MULT x the motherboard 7M rate. Every cycle that has to
+// reach the Amiga is re-issued by a BUS BRIDGE (BIU) that reproduces a real
+// 68000 S0..S7 bus cycle on the 7M grid. The core is held in wait states
+// (DTACK withheld) until the bridge completes.
 //
-// NEW: Zorro II autoconfig SD-card device (SF2000 adaptation). As the CPU,
-// our own 64KB I/O space is served by the INTERNAL-MUX pattern: cycles to
-// the board go out on the physical bus unchanged (AS/addr/strobes as always,
-// Gary's auto-DTACK is simply ignored), while the core's DTACKn / iEdb /
-// VPAn / BERRn inputs are muxed to internal sources. Zero changes to the
-// tristate / CBT / arbitration logic; internal cycles even complete during
-// DMA grants. Modules: autoconfig_zii_b64.v, sd_subsystem.v (which wraps the
-// UNCHANGED sdcard.v/shifter.v/fifo.v/tx_cpu_buf.v/rx_cpu_buf.v), boot ROM
-// in EBR initialised from sfsd.mem.
+// ARCHITECTURAL NOTE — THIS IS NOT A CLOCK DOMAIN CROSSING.
+//   There is exactly ONE clock in this design: clk_12x. The 7M "domain" is a
+//   set of clock enables derived from a divide-by-12 counter that is phase-
+//   locked to the motherboard 7M. The fast CPU "domain" is another set of
+//   enables (clk/2). Handshakes between them are ordinary synchronous logic:
+//   no metastability, no gray coding, no request/ack synchronisers. The only
+//   true asynchronous inputs are the motherboard pins (DTACK/VPA/BERR/BR/
+//   BGACK/IPL/RESET/HALT and the 7M clock itself), which are the only places
+//   that need 2FF synchronisers.
 //
-// BUILD TRAP: sfsd.mem joins microrom.mem/nanorom.mem — must be present in
-// prj/base64_fx68k/impl1/ before build; Diamond "Clean" deletes it.
+// WHAT CHANGED vs THE 1x BUILD (all of these silently break at 6x):
+//   1. E is generated HERE at 7M/10 (6 low / 4 high). The core's own E runs
+//      CPU_MULT times too fast and is discarded.
+//   2. VPA/VMA 6800-style cycles are run by the bridge against OUR E, not by
+//      the core. The core's VPAn is tied deasserted.
+//   3. IACK cycles terminate with DTACK + autovector number (24+level), which
+//      is behaviourally identical to a VPA autovector but needs no E timing.
+//   4. The RESET instruction is stretched to >=124 * 141 ns. At 6x the core
+//      only holds oRESETn for ~2.9 us, which is too short to reset the CIAs.
+//   5. IPL is re-sampled on the 7M grid with a 2-of-2 filter. At 6x the
+//      core's own two-sample debounce window shrinks to 47 ns and would latch
+//      Paula's INTREQ update glitches.
+//   6. BG is retimed onto the 7M grid.
+//   7. The bridge, not the core, owns the physical pins (latched address /
+//      data / strobes), because the core moves on as soon as it is acked.
 //
-// Pairs with base64.lpf. Toolchain: Diamond / Synplify Pro.
+// PHASE_OFS is KEPT and now has a physical meaning: it aligns our internal
+// notion of the 7M rising edge with the real one at Gary/Agnus, absorbing the
+// 74LVC1G17 delay, the FPGA input path, the capture pipeline and the output
+// path. See DESIGN_NOTES_6x.md for the budget.
+//
+// Pairs with base64_6x.fdc. Toolchain: Diamond / Synplify Pro.
 // fx68k ports match UPSTREAM ijor/fx68k (no E_rise/E_fall, eab[23:1]).
-//
-// FIRST-CONTACT SAFETY: CBT switch OEs are held OFF (bus isolated) until the
-// PLL is locked and the power-up counter expires, so the FPGA never drives
-// the Amiga bus with indeterminate values while configuring.
+// SDRAM / SD / autoconfig are stripped for bring-up; their PORTS are kept so
+// base64.lpf needs no edits, and hooks are marked "REATTACH" below.
 // ============================================================================
 `default_nettype none
 
-module base64_top (
+module base64_top #(
+    // ---- speed ----------------------------------------------------------
+    // 12 master clocks per 7M period. CPU_MULT must divide 12 evenly:
+    //   6 -> 2 master clocks/CPU clock (42.6 MHz)  <-- target
+    //   4 -> 3, 3 -> 4, 2 -> 6, 1 -> 12 (bit-identical to the old build)
+    // See DESIGN_NOTES: only CPU_MULT<=3 relaxes the fx68k Fmax requirement.
+    parameter integer CPU_MULT   = 6,
+
+    // ---- 7M grid alignment ----------------------------------------------
+    // Larger PHASE_OFS moves our S-state grid EARLIER relative to the real
+    // 7M edge, in 11.75 ns steps. Calibrate once (see notes), then leave it.
+    parameter integer PWRUP_BIT  = 23,   // sim override only
+    parameter [4:0]   PHASE_OFS  = 5'd2,
+
+    // Master clocks between the nominal S4 falling edge and the instant we
+    // read the 2FF-synchronised DTACK/VPA/BERR. Set equal to the synchroniser
+    // depth (2) so the value we act on is the pin value AT the S4 falling
+    // edge — i.e. exactly the sample point of a real 68000.
+    // DTACK_LAT positions the sample point. SMP_N master clocks after the
+    // S5 tick we read s_dtack_n[1], which lags the pin by 2 -- so DTACK_LAT=2
+    // acts on the pin value exactly AT S5, a real 68000's sample point.
+    //
+    // But a real 68000 drives AS straight off its internal grid, whereas our
+    // AS goes out through a pin register, the output buffer (SLEWRATE=SLOW)
+    // and a CBTD FET: measured 35.2 ns, i.e. 3 master clocks. Gary's DTACK
+    // comes back that much later, so our sample point has to move with it.
+    // Hence 2 (synchroniser) + 3 (our AS output delay) = 5, and 4 already
+    // recovers the clock in simulation.
+    //
+    // This is the knob PHASE_OFS cannot substitute for: PHASE_OFS slides the
+    // whole grid, moving AS and the sample point together, which is exactly
+    // why PHASE_OFS 1 and 2 measured identically on hardware. DTACK_LAT is
+    // the only parameter that moves the sample point RELATIVE to AS.
+    //
+    // Sweep 2..6 and watch LAT_DEBUG: 5 blinks = losing a clock, 4 = fixed.
+    // Do not exceed 6 -- the sample must land before the S6 tick.
+    parameter integer DTACK_LAT  = 4,
+
+    // Master clocks by which the core's DTACK leads the bridge's data-latch
+    // edge. 1 is derived in the notes; 2 buys margin for back-to-back cycles
+    // at the cost of nothing. MUST be >=1 and <=5.
+    parameter integer ACK_LEAD   = 2,
+    // EXPERIMENTAL, DEFAULT OFF -- acking the core the moment DTACK is
+    // stable rather than at tick_ack. This is the right IDEA (see the
+    // ST_S6 comment) but this implementation is WRONG: Verilator against
+    // the real core drops from 50 loop iterations to 1, i.e. the core goes
+    // off the rails. Acking this early makes the core negate AS while the
+    // bridge is still in S6/S7, and the ack-clear path then races the
+    // FSM. Needs the request/ack handshake reworked, not a parameter.
+    // EARLY_ACK: DEAD END, leave at 0. Measured, not guessed.
+    //
+    // The idea was to ack the core as soon as DTACK is stable so it could
+    // turn its next cycle around inside our S5/S6/S7. It works in a model
+    // where the slave drives read data for the whole of AS-low, and it
+    // green-screens real hardware, because real slaves assert DTACK BEFORE
+    // the data is on the bus. A 68000 tolerates that: it latches at S7,
+    // ~141 ns after DTACK. Acking early collapses that margin to a few
+    // master clocks -- at 6x we destroy the exact safety margin the 68000
+    // bus protocol is built around.
+    //
+    // Simulated against the real core, with DTACK at AS+294 ns (as
+    // captured on hardware) and data valid only at AS+400 ns:
+    //     EARLY_ACK=0 -> 50 loop iterations, clean
+    //     EARLY_ACK=1 ->  0 loop iterations, dead
+    // Restricting it to writes only is safe but measured no gain at all
+    // (34 iterations either way), so it is not worth the complexity.
+    // RETIME: 0 = bridge (re-synthesised S0..S7), 1 = SF2000-style
+    // pass-through with the core's strobes gated onto the 7M grid.
+    parameter         RETIME     = 1'b1,
+    parameter         EARLY_ACK  = 1'b0,
+    parameter         DBG_BUNDLE = 1'b0,   // debug done -- keep 0 now
+
+    // e_cnt value at which VMA is asserted during a 6800 cycle. E is low for
+    // e_cnt 0..5, high for 6..9, so 1 gives ~700 ns of VMA setup before E
+    // rises. Anything in 0..3 is safe.
+    parameter [3:0]   E_VMA_AT   = 4'd1,
+
+    // 1 = terminate IACK cycles internally with 24+level (recommended).
+    parameter         IACK_AV    = 1'b1,
+
+    // 1 = green LED blinks the shortest observed external cycle length in 7M
+    // clocks (4 = no wait states, 5 = one wait state, ...).
+    parameter         LAT_DEBUG  = 1'b0
+)(
     // Clocks from carrier
     input  wire        clk_7m,        // C7  buffered motherboard 7M (74LVC1G17)
-    input  wire        clk_12x,       // L1  ICS570B x12 (85.1 MHz, PLL-locked to 7M)
+    input  wire        clk_12x,       // L1  ICS570B x12 (85.1 MHz, PLL-locked)
 
     // 68000 socket (3.3V side of the CBTD switches)
     output wire [23:1] cpu_a,
@@ -64,8 +163,8 @@ module base64_top (
     output wire        cbt_oe_a8_17_n,
     output wire        cbt_oe_a1_7_n,
 
-    // Idle module resources safely in compat mode
-    output wire [12:0] sdram_a,
+    // Idled in turbo bring-up (ports kept so base64.lpf is unchanged)
+    output wire [12:0] sdram_a,   // driven by sdram_ctrl
     output wire [1:0]  sdram_ba,
     inout  wire [15:0] sdram_dq,
     output wire [1:0]  sdram_dqm,
@@ -75,61 +174,66 @@ module base64_top (
     output wire        sdram_cas_n,
     output wire        sdram_we_n,
     output wire        sdram_cs_n,
-
-    // On-module micro-SD slot, used in SPI mode:
-    //   sd_clk = SCLK, sd_cmd = MOSI, sd_d[0] = MISO, sd_d[3] = CS_n,
-    //   sd_d[2:1] released (add PULLMODE=UP in the LPF on sd_cmd/sd_d).
-    //   The slot has no card-detect line; CD is tied "present" internally.
     output wire        sd_clk,
     inout  wire        sd_cmd,
     inout  wire [3:0]  sd_d,
 
     output wire        led_r,
     output wire        led_g,
-    output wire        led_b,
-    output wire        uart_tx,
-    input  wire        uart_rx
+    output wire        led_b
 );
 
-    // ------------------------------------------------------------------
-    // Master clock domain: everything on clk_12x. The ICS570B loop makes it
-    // mesochronous with the 7M bus, so 7M is treated as *data* (2FF-synced)
-    // and its edge reloads the divide-by-12 phase counter.
-    // ------------------------------------------------------------------
     wire clk = clk_12x;
 
-    // --- power-up / reset sequencing ---
-    // Long cold-boot hold: ~98 ms after configuration before the core's
-    // first fetch, so the USB ROM board, ICS570B lock, rails and the
-    // Amiga's own POR are all settled long before we fetch the reset
-    // vector. Cures the cold-boot double-fault wedge (dim LED / random
-    // early guru colors, recoverable with Ctrl-A-A). Warm resets are
-    // unaffected: this counter runs once per FPGA configuration.
+    // Master clocks per emulated CPU clock period, and the phi2 offset.
+    // Sized localparams throughout: part-selecting an `integer` parameter is
+    // legal SV but not portable across synthesis front ends.
+    // CLK_MULT is the ICS570B multiplier on the incoming 7M. It is a
+    // parameter only so the 24x experiment is a one-line change -- but read
+    // DESIGN_NOTES_6x.md before raising it: doubling the master clock does
+    // NOT buy fx68k any settling time, it only makes STA harder. The real
+    // lever is the multicycle constraints in base64_6x.fdc.
+    localparam integer CLK_MULT = 12;
+    localparam [4:0] PH_TOP = CLK_MULT[4:0] - 5'd1;      // counter wrap
+    localparam [4:0] PH_HALF= CLK_MULT[4:0] / 5'd2;      // "falling edge"
+    localparam [4:0] MC4    = CLK_MULT[4:0] / CPU_MULT;      // 2,3,4,6,12
+    localparam [4:0] MCH4   = (CLK_MULT[4:0] / CPU_MULT) / 5'd2;
+    localparam [4:0] PH_ACK = PH_HALF - ACK_LEAD;
+    localparam [2:0] SMP_N  = DTACK_LAT;
+    // CPU_MULT must divide CLK_MULT evenly and give an even MC4.
+
+    // ========================================================================
+    // 1. Power-up hold
+    // ========================================================================
+    // ~98 ms after configuration before the core's first fetch: rails,
+    // ICS570B lock and the Amiga's own POR are all settled. Runs once per
+    // FPGA configuration; warm resets are unaffected.
+    // NOTE (cold boot): see DESIGN_NOTES — the robust fix is to make the FPGA
+    // the reset SOURCE at the end of this hold rather than relying on the
+    // board is expected to come up on a warm reset (Ctrl-A-A) during bring-up.
+    // PWRUP_BIT is a parameter purely so simulation can shorten the ~98 ms
+    // hold. Do not lower it in a real build.
     reg  [23:0] pwrup_cnt = 24'd0;
-    wire        pwrup_done = pwrup_cnt[23];
+    wire        pwrup_done = pwrup_cnt[PWRUP_BIT];
     always @(posedge clk)
         if (!pwrup_done) pwrup_cnt <= pwrup_cnt + 24'd1;
 
-    // --- synchronize async inputs (2FF) ---
+    // ========================================================================
+    // 2. Asynchronous input synchronisers (the ONLY real CDC in the design)
+    // ========================================================================
     reg [1:0] s_dtack_n, s_vpa_n, s_berr_n, s_br_n, s_bgack_n;
     reg [1:0] s_reset_n, s_halt_n, s_cfgin_n, s_7m;
-    reg [2:0] s_ipl_a, s_ipl_n;
+    reg [2:0] s_ipl_a, s_ipl_b;
 
     // 7M capture hardening: the ICS570B is a zero-delay multiplier, so 7M
-    // edges arrive at the FPGA coincident with clk_12x edges. Sampling
-    // clk_7m directly on the rising edge is therefore a race decided by the
-    // (unconstrained) routing delta between the clock tree and the 7m data
-    // path - it can flip by one cycle between builds, shifting the
-    // EFFECTIVE phase alignment and requiring a different PHASE_OFS per
-    // build (observed: the original build wanted 4'd3, later fuller builds
-    // 4'd2). Capturing on the FALLING edge puts the sample 5.86 ns away
-    // from the coincident edge - far outside the +/-1-2 ns routing
-    // variation - making the captured cycle deterministic across builds
-    // and seeds. NOTE: after this change PHASE_OFS is calibrated once and
-    // is then stable forever (try current value first, then +/-1).
+    // edges arrive coincident with clk_12x edges. Sampling on the FALLING
+    // edge puts the sample 5.86 ns away from that coincidence — far outside
+    // routing variation — making the captured cycle deterministic across
+    // builds and seeds. (This is why PHASE_OFS stopped moving between builds.)
     reg s_7m_fall;
     always @(negedge clk) s_7m_fall <= clk_7m;
 
+    reg s_7m_d;
     always @(posedge clk) begin
         s_dtack_n <= {s_dtack_n[0], cpu_dtack_n};
         s_vpa_n   <= {s_vpa_n[0],   cpu_vpa_n};
@@ -141,274 +245,176 @@ module base64_top (
         s_cfgin_n <= {s_cfgin_n[0], cfgin_n};
         s_7m      <= {s_7m[0],      s_7m_fall};
         s_ipl_a   <= cpu_ipl_n;
-        s_ipl_n   <= s_ipl_a;
+        s_ipl_b   <= s_ipl_a;
+        s_7m_d    <= s_7m[1];
     end
+    wire edge_7m = s_7m[1] & ~s_7m_d;
 
-    // --- phase generator: divide clk_12x by 12, aligned to 7M ---
-    // PHASE_OFS trims where the emulated CPU clock edges fall vs the real 7M
-    // (C1/C3). Tune on hardware with Reveal against E and the 7M edge.
-    localparam [3:0] PHASE_OFS = 4'd2;
-    reg  [3:0] ph_cnt = 4'd0;
-    reg        r_7m_d;
-    wire       edge_7m = s_7m[1] & ~r_7m_d;
+    // ========================================================================
+    // 3. 7M grid: divide-by-12, phase-locked, GLITCH IMMUNE
+    // ========================================================================
+    // The old code reloaded ph_cnt on EVERY 7M edge. With a locked ICS570B
+    // that reload is a no-op, but a single jittery or noisy edge would jump
+    // the counter — and if the CPU phases were derived from it, that jump
+    // would emit two consecutive enPhi1 (or swallow one) and corrupt fx68k.
+    // Here the counter free-runs and only hard-reloads after SLIP_TOL
+    // consecutive disagreements, i.e. a genuine PLL slip rather than noise.
+    // The CPU phase generator (section 4) is independent of it regardless.
+    localparam integer SLIP_TOL = 3;
+
+    reg [4:0] ph        = 5'd0;
+    reg [1:0] slip_cnt  = 2'd0;
+    reg       ph_locked = 1'b0;
+    reg       ph_slip   = 1'b0;     // sticky, for LED/Reveal
+
     always @(posedge clk) begin
-        r_7m_d <= s_7m[1];
-        if (edge_7m)              ph_cnt <= PHASE_OFS;
-        else if (ph_cnt == 4'd11) ph_cnt <= 4'd0;
-        else                      ph_cnt <= ph_cnt + 4'd1;
+        ph <= (ph == PH_TOP) ? 5'd0 : ph + 5'd1;
+        if (edge_7m) begin
+            if (ph == PHASE_OFS) begin
+                slip_cnt  <= 2'd0;
+                ph_locked <= 1'b1;
+            end else begin
+                if (!ph_locked) begin
+                    ph <= PHASE_OFS;                 // initial acquisition
+                end else if (slip_cnt == SLIP_TOL[1:0]) begin
+                    ph       <= PHASE_OFS;           // real slip: re-acquire
+                    slip_cnt <= 2'd0;
+                    ph_slip  <= 1'b1;
+                end else begin
+                    slip_cnt <= slip_cnt + 2'd1;     // noise: ignore
+                end
+            end
+        end
     end
 
-    // COMPAT: one full 68k cycle per 12 master clocks.
-    // fx68k wants enPhi1 asserted the cycle before the CPU-clock high phase,
-    // enPhi2 the cycle before the low phase.
-    wire en_phi1 = (ph_cnt == 4'd0);
-    wire en_phi2 = (ph_cnt == 4'd6);
+    // The two 7M half-clock ticks, and the early tick used to lead the ack.
+    wire tick_r   = (ph == 5'd0);      // "rising edge of 7M"  -> S0,S2,S4,S6
+    wire tick_f   = (ph == PH_HALF);      // "falling edge of 7M" -> S1,S3,S5,S7
+    wire tick_ack = (ph == PH_ACK);    // tick_f minus ACK_LEAD master clocks
+
+    // ========================================================================
+    // 4. CPU phase generator — FREE RUNNING, decoupled from the 7M resync
+    // ========================================================================
+    // Exactly clk/MC, so the emulated CPU clock is exactly CPU_MULT x 7M.
+    // Deliberately NOT reloaded by edge_7m: the core does not need to be
+    // phase-aligned to the bus any more (the bridge is), and a reload could
+    // break the strict phi1/phi2 alternation fx68k requires.
+    reg [4:0] cpu_ph = 5'd0;
+    always @(posedge clk)
+        cpu_ph <= (cpu_ph == MC4 - 5'd1) ? 5'd0 : cpu_ph + 5'd1;
+
+    wire en_phi1 = (cpu_ph == 4'd0);
+    wire en_phi2 = (cpu_ph == MCH4);
+
+    // ========================================================================
+    // 5. E clock — 7M/10, six low then four high. NEVER tri-stated.
+    // ========================================================================
+    reg  [3:0] e_cnt = 4'd0;
+    reg        e_pin = 1'b0;
+    wire [3:0] e_nxt = (e_cnt == 4'd9) ? 4'd0 : e_cnt + 4'd1;
+    always @(posedge clk) if (tick_r) begin
+        e_cnt <= e_nxt;
+        e_pin <= (e_nxt >= 4'd6);
+    end
+    wire e_fall_tick = tick_r & (e_cnt == 4'd9);   // E goes low on this tick
+
+    // ========================================================================
+    // 6. IPL: re-pace onto the 7M grid with a 2-of-2 stability filter
+    // ========================================================================
+    reg [2:0] ipl_g1 = 3'b111, ipl_g2 = 3'b111, ipl_out = 3'b111;
+    always @(posedge clk) if (tick_r) begin
+        ipl_g1 <= s_ipl_b;
+        ipl_g2 <= ipl_g1;
+        if (ipl_g1 == ipl_g2) ipl_out <= ipl_g1;
+    end
+
+    // ========================================================================
+    // 7. Reset / halt
+    // ========================================================================
+    wire core_oreset_n, core_ohalted_n;
+
+    // Stretch the RESET instruction to >=124 real 7M clocks (~17.5 us).
+    localparam [7:0] RST_HOLD_7M = 8'd132;
+    reg        rst_stretch = 1'b0;
+    reg  [7:0] rst_cnt     = 8'd0;
+    always @(posedge clk) begin
+        if (!pwrup_done) begin
+            rst_stretch <= 1'b0;
+            rst_cnt     <= 8'd0;
+        end else if (!core_oreset_n) begin
+            rst_stretch <= 1'b1;
+            rst_cnt     <= 8'd0;
+        end else if (rst_stretch && tick_r) begin
+            if (rst_cnt >= RST_HOLD_7M) rst_stretch <= 1'b0;
+            else                        rst_cnt <= rst_cnt + 8'd1;
+        end
+    end
 
     // ------------------------------------------------------------------
-    // fx68k core (upstream ijor)
+    // /RESET and /HALT are SEPARATE nets on this board, which lets us use
+    // real 68000 semantics and delete two hacks that the shared-net
+    // assumption had forced:
+    //
+    //   * The 68000 resets from outside ONLY when /RESET and /HALT are
+    //     asserted TOGETHER. A RESET instruction drives /RESET alone, so it
+    //     cannot reset us -- no "ignore external reset while we drive it"
+    //     guard is needed, and the old we_drive_rst mask is gone. If the
+    //     user hits Ctrl-A-A midway through our stretch, /HALT goes low too
+    //     and we reset, which is exactly correct.
+    //
+    //   * The halt watchdog is deleted. It existed to catch a missed cold
+    //     boot; warm boot is the agreed bring-up path for now. Nothing
+    //     auto-resets the machine any more, so a genuine double bus fault
+    //     now HALTS and stays halted -- which is what a real 68000 does and
+    //     is far easier to debug than a box that silently reboots itself.
+    //     The red LED reports it (section 12).
     // ------------------------------------------------------------------
+    wire ext_reset = (~s_reset_n[1] & ~s_halt_n[1]) | ~pwrup_done;
+
+    // Open-drain, and strictly independent: we never drive /HALT because of
+    // a RESET instruction, and never drive /RESET because of a halt.
+    assign cpu_reset_n = (~core_oreset_n | rst_stretch) ? 1'b0 : 1'bz;
+    assign cpu_halt_n  = (~core_ohalted_n)              ? 1'b0 : 1'bz;
+
+    // ========================================================================
+    // 8. fx68k core
+    // ========================================================================
     wire        core_rw, core_as_n, core_lds_n, core_uds_n;
-    wire        core_e, core_vma_n;
+    wire        core_e_unused, core_vma_n_unused;
     wire        core_fc0, core_fc1, core_fc2;
-    wire        core_bg_n, core_oreset_n, core_ohalted_n;
+    wire        core_bg_n;
     wire [15:0] core_dout;
     wire [23:1] core_a;
 
-    // External reset: a real 68000 resets when RESET & HALT are both driven
-    // low externally. Mask our own open-drain drive so the RESET instruction
-    // doesn't reset the core itself.
-    // External reset: RESET & HALT both low resets the core. Masked ONLY
-    // while the core itself executes the RESET instruction (oRESETn low),
-    // since we drive the shared /RST net then. Deliberately NOT masked by
-    // oHALTEDn: a double-bus-faulted (halted) 68000 must respond to
-    // external reset - that's how a real Amiga recovers from a guru. (We
-    // drive HALT low while halted; the resulting low net asserts ext_reset
-    // and the core resets itself out of the halt, exactly like real
-    // silicon on the A500's tied RESET+HALT net.)
-    wire ext_reset = (~s_reset_n[1] & ~s_halt_n[1] & core_oreset_n)
-                     | ~pwrup_done;
+    reg         core_dtack_lo = 1'b0;
+    reg         core_berr_lo  = 1'b0;
+    reg  [15:0] rd_data       = 16'hFFFF;
+    reg         av_valid      = 1'b0;
+    reg  [7:0]  av_num        = 8'd0;
 
-    // ------------------------------------------------------------------
-    // Autoconfig + SD-card device (internal bus slaves)
-    // ------------------------------------------------------------------
-    // Device reset: must fire on EVERY /RST assertion, including the RESET
-    // instruction (which loops back through the open-drain pin into
-    // s_reset_n) - Kickstart executes RESET early in boot and then expects
-    // all expansions unconfigured, so this must NOT use ext_reset (which
-    // deliberately masks the RESET instruction for the core itself).
-    wire devices_reset = ~s_reset_n[1] | ~pwrup_done;
-
-    wire         ac_oe, ac_access, sd_configured, ac_dtack_n;
-    wire [15:12] ac_dout;
-    wire [7:0]   base_sd;
-    wire         cfgout_int_n;
-
-    wire         sd_space, sd_dtack_n;
-    wire [15:0]  sd_dout;
-    wire         sd_miso_w, sd_ss_n_w, sd_sclk_w, sd_mosi_w;
-
-    autoconfig_zii_b64 autoconfig (
-        .clk          (clk),
-        .reset        (devices_reset),
-        .cfgin_n      (s_cfgin_n[1]),
-        .as_n         (core_as_n),
-        .uds_n        (core_uds_n),
-        .lds_n        (core_lds_n),
-        .rw           (core_rw),
-        .a_high       (core_a[23:16]),
-        .a_low        (core_a[6:1]),
-        .d_in         (core_dout[15:12]),
-        .d_out        (ac_dout),
-        .data_oe      (ac_oe),
-        .ac_access    (ac_access),
-        .base_sd      (base_sd),
-        .sd_configured(sd_configured),
-        .cfgout_n     (cfgout_int_n),
-        .dtack_n      (ac_dtack_n)
-    );
-
-    sd_subsystem sdsys (
-        .clk          (clk),
-        .reset        (devices_reset),
-        .a            (core_a),
-        .as_n         (core_as_n),
-        .uds_n        (core_uds_n),
-        .lds_n        (core_lds_n),
-        .rw           (core_rw),
-        .d_in         (core_dout),
-        .sd_configured(sd_configured),
-        .base_sd      (base_sd),
-        .sd_space     (sd_space),
-        .d_out        (sd_dout),
-        .dtack_n      (sd_dtack_n),
-        .rom_we       (1'b0),          // flash_preload lands here in phase 3b
-        .rom_waddr    (15'd0),
-        .rom_wdata    (8'd0),
-        .sd_miso      (sd_miso_w),
-        .sd_cd_n      (1'b0),          // no CD line on the module slot: present
-        .sd_ss_n      (sd_ss_n_w),
-        .sd_sclk      (sd_sclk_w),
-        .sd_mosi      (sd_mosi_w)
-    );
-
-    // ------------------------------------------------------------------
-    // Fast RAM: Zorro II autoconfig (8MB, graceful fallback) bridging the
-    // Amiga bus to the on-module IS42S16160B via the verified sdram_ctrl.
-    // Fastmem cycles are served by internal muxing AND isolated from the
-    // motherboard by opening the switchable CBTs (fm_active -> bus_enable),
-    // so CPU<->SDRAM traffic runs decoupled from the 7 MHz chip bus.
-    // ------------------------------------------------------------------
-    wire        fm_space, fm_active, fm_dtack_n, fm_cfgout_n;
-    wire [15:0] fm_dout;
-    wire        fm_ac_access, fm_ac_oe, fm_ac_dtack_n;
-    wire [3:0]  fm_ac_dout;
-    // sdram_ctrl handshake
-    wire        sd_req, sd_we, sd_ack, sdram_ready;
-    wire [23:0] sd_saddr;
-    wire [15:0] sd_wdata, sd_rdata;
-    wire [1:0]  sd_byte_en;
-    wire        sd_wr_valid;
-    // internal SDRAM clock (forwarded to the pin via ODDR below)
-    wire        sdram_clk_int;
-
-    // Autoconfig daisy-chain within our board: the SD ROM device configures
-    // first (it holds the boot ROM KS needs early), then passes CFGOUT to the
-    // fastmem device's CFGIN via cfgout_int_n. The fastmem device's CFGOUT
-    // (fm_cfgout_n) drives the external chain pin below. Declared here so it
-    // precedes the fastmem instance (default_nettype none requires it).
-    wire fm_cfgin_n = cfgout_int_n;
-
-    fastmem_zii #(
-        .OFFER_SPLIT(1'b1)
-    ) fastmem (
-        .clk        (clk),
-        .reset      (devices_reset),
-        .cfgin_n    (fm_cfgin_n),
-        .as_n       (core_as_n),
-        .uds_n      (core_uds_n),
-        .lds_n      (core_lds_n),
-        .rw         (core_rw),
-        .a          (core_a),
-        .d_in       (core_dout),
-        .fm_space   (fm_space),
-        .fm_dout    (fm_dout),
-        .fm_dtack_n (fm_dtack_n),
-        .fm_active  (fm_active),
-        .cfgout_n   (fm_cfgout_n),
-        .fm_ac_access (fm_ac_access),
-        .fm_ac_dout   (fm_ac_dout),
-        .fm_ac_oe     (fm_ac_oe),
-        .fm_ac_dtack_n(fm_ac_dtack_n),
-        .req        (sd_req),
-        .we         (sd_we),
-        .saddr      (sd_saddr),
-        .wdata      (sd_wdata),
-        .byte_en    (sd_byte_en),
-        .wr_valid   (sd_wr_valid),
-        .ack        (sd_ack),
-        .rdata      (sd_rdata),
-        .sdram_ready(sdram_ready)
-    );
-
-    sdram_ctrl #(
-        .CLK_HZ(85_130_000)
-    ) sdramc (
-        .clk        (clk),
-        .reset      (devices_reset),
-        .req        (sd_req),
-        .we         (sd_we),
-        .wr_valid   (sd_wr_valid),
-        .addr       (sd_saddr),
-        .wdata      (sd_wdata),
-        .byte_en    (sd_byte_en),
-        .ack        (sd_ack),
-        .rdata      (sd_rdata),
-        .ready      (sdram_ready),
-        .sdram_a    (sdram_a),
-        .sdram_ba   (sdram_ba),
-        .sdram_dq   (sdram_dq),
-        .sdram_dqm  (sdram_dqm),
-        .sdram_clk  (sdram_clk_int),
-        .sdram_cke  (sdram_cke),
-        .sdram_cs_n (sdram_cs_n),
-        .sdram_ras_n(sdram_ras_n),
-        .sdram_cas_n(sdram_cas_n),
-        .sdram_we_n (sdram_we_n)
-    );
-
-    // Forward the SDRAM clock through an ODDR (phase-aligned, verified in the
-    // smoke test). sdram_clk_int carries no data — the command/data pins are
-    // registered to clk and captured by the SDRAM on this forwarded clock.
-    ODDRX1F sdram_clk_oddr (
-        .SCLK (clk),
-        .RST  (1'b0),
-        .D0   (1'b0),
-        .D1   (1'b1),
-        .Q    (sdram_clk)
-    );
-    wire _unused_sclk = sdram_clk_int;
-
-    // Core input muxes - the whole internal-slave trick. own_space decode is
-    // glitch-safe: the 68000 holds the address stable from before AS to after
-    // AS, and sd_configured/base_sd/cfgout_n only change at cycle boundaries
-    // (cfgout_n is registered on the rising edge of AS).
-    //
-    // REGISTERED: the core's inputs must come from flops, exactly as they did
-    // pre-SD (s_*_n[1] were 2FF outputs feeding the core directly). Muxing
-    // combinationally in front of iEdb/DTACKn added logic levels to paths the
-    // 85 MHz build has no margin for. The one-clock (11.7 ns) added latency
-    // is invisible at 7 MHz bus pace: worst case DTACK is recognised one
-    // master clock later, i.e. the same category of delay as the existing
-    // 2FF synchronisers, and slaves hold DTACK until AS ends anyway.
-    wire own_space = ac_access | sd_space | fm_space | fm_ac_access;
-
-    // DTACK / iEdb mux.
-    //
-    // Most sources are registered here for timing closure. The FASTMEM memory
-    // path is the exception: fm_dtack_n and fm_dout are ALREADY stable,
-    // mutually-aligned registered outputs of the bridge FSM, so we route them
-    // COMBINATIONALLY into the core (bypassing this mux register). That removes
-    // one clock of latency from ack->core, which at 7 MHz is the difference
-    // between hitting and missing the 68000's S4 DTACK sample point (i.e. one
-    // wait state per fastmem access). Because both DTACK and data bypass
-    // together, they stay aligned - no risk of sampling DTACK with stale data.
-    //
-    // reg-path result (for all non-fastmem-memory sources)
-    reg        core_dtack_r;
-    reg [15:0] core_iedb_r;
-    reg        core_vpa_n, core_berr_n;
-    always @(posedge clk) begin
-        core_dtack_r <= ac_access    ? ac_dtack_n    :
-                        sd_space     ? sd_dtack_n    :
-                        fm_ac_access ? fm_ac_dtack_n :
-                                       s_dtack_n[1];
-
-        core_iedb_r  <= ac_oe                 ? {ac_dout, 12'hFFF}    :
-                        fm_ac_oe              ? {fm_ac_dout, 12'hFFF} :
-                        (sd_space && core_rw) ? sd_dout               :
-                                                cpu_d;
-
-        core_vpa_n   <= own_space ? 1'b1 : s_vpa_n[1];
-        core_berr_n  <= own_space ? 1'b1 : s_berr_n[1];
-    end
-
-    // Combinational final mux: fastmem memory path wins and bypasses the
-    // register above; everything else uses the registered result.
-    wire        core_dtack_n = fm_space ? fm_dtack_n : core_dtack_r;
-    wire [15:0] core_iedb    = (fm_space && core_rw) ? fm_dout : core_iedb_r;
+    // REATTACH: internal slaves (autoconfig / SD / fastmem) mux in here.
+    wire [15:0] core_iedb  =
+          fm_ac_oe ? {fm_ac_dout, 12'hFFF}
+        : fm_space ? fm_dout
+        : RETIME   ? (rt_av ? {8'h00, av_num} : rt_rd)
+                   : (av_valid ? {8'h00, av_num} : rd_data);
+    wire        int_dtack_lo  = ~fm_dtack_n | ~fm_ac_dtack_n;
+    wire        core_dtack_n = ~((RETIME ? rt_dtack_lo : core_dtack_lo)
+                                 | int_dtack_lo);
+    wire        core_berr_n  = ~core_berr_lo;
 
     fx68k cpu (
         .clk      (clk),
         .enPhi1   (en_phi1),
         .enPhi2   (en_phi2),
-        .HALTn    (s_halt_n[1] | ~core_oreset_n | ~core_ohalted_n),
+        .HALTn    (s_halt_n[1] | ~core_ohalted_n),   // mask our own drive only
         .extReset (ext_reset),
         .pwrUp    (~pwrup_done),
         .oRESETn  (core_oreset_n),
         .oHALTEDn (core_ohalted_n),
-        .E        (core_e),
-        .VPAn     (core_vpa_n),
-        .VMAn     (core_vma_n),
+        .E        (core_e_unused),      // 6x too fast — discarded, see sec.5
+        .VPAn     (1'b1),               // bridge owns all 6800 cycles
+        .VMAn     (core_vma_n_unused),
         .ASn      (core_as_n),
         .eRWn     (core_rw),
         .LDSn     (core_lds_n),
@@ -421,251 +427,647 @@ module base64_top (
         .BRn      (s_br_n[1]),
         .BGn      (core_bg_n),
         .BGACKn   (s_bgack_n[1]),
-        .IPL2n    (s_ipl_n[2]),
-        .IPL1n    (s_ipl_n[1]),
-        .IPL0n    (s_ipl_n[0]),
+        .IPL2n    (ipl_out[2]),
+        .IPL1n    (ipl_out[1]),
+        .IPL0n    (ipl_out[0]),
         .iEdb     (core_iedb),
         .oEdb     (core_dout),
         .eab      (core_a)
     );
 
-    // ------------------------------------------------------------------
-    // Bus ownership & tri-state. A real 68000 releases A/D/AS/UDS/LDS/RW/FC/
-    // VMA while the bus is granted; E and BG stay driven.
-    // ------------------------------------------------------------------
-    // Released when BGACK is asserted, or when we've granted BG and our own
-    // AS is idle. Deliberately NOT dependent on BR: a requester may legally
-    // release BR before/as it asserts BGACK; re-driving in that window
-    // would cause contention. fx68k holds BG until BGACK is seen, so the
-    // second term covers the handoff and the first term the DMA burst.
-    // NOTE: cycles to our own autoconfig/SD space intentionally still go out
-    // on the bus (AS/addr/strobes, data on writes) - nothing on the A500
-    // decodes E8/E9 onto the data bus, the core ignores external DTACK for
-    // those cycles via the mux above, and this keeps the proven tristate
-    // logic completely untouched.
-    wire bus_released = ~s_bgack_n[1] | (~core_bg_n & core_as_n);
-    wire drv_bus = ~bus_released;
+    wire [2:0] core_fc = {core_fc2, core_fc1, core_fc0};
 
-    assign cpu_a     = drv_bus ? core_a : 23'bz;
-    assign cpu_as_n  = drv_bus ? core_as_n    : 1'bz;
-    assign cpu_uds_n = drv_bus ? core_uds_n   : 1'bz;
-    assign cpu_lds_n = drv_bus ? core_lds_n   : 1'bz;
-    assign cpu_rw    = drv_bus ? core_rw      : 1'bz;
-    assign cpu_fc    = drv_bus ? {core_fc2, core_fc1, core_fc0} : 3'bz;
-    assign cpu_vma_n = drv_bus ? core_vma_n   : 1'bz;
-    assign cpu_bg_n  = core_bg_n;
-    assign cpu_e     = core_e;
+    // ========================================================================
+    // 9. Bus ownership
+    // ========================================================================
+    reg  bg_pin_n = 1'b1;
+    always @(posedge clk) if (tick_r) bg_pin_n <= core_bg_n;   // retime to 7M
 
-    // Data bus: drive only during write cycles we own.
-    wire drv_data = drv_bus & ~core_as_n & ~core_rw;
-    assign cpu_d = drv_data ? core_dout : 16'bz;
+    reg  p_as_n = 1'b1;
+    wire bx_idle;
+    // A real 68000 asserts /BG when /BR arrives but KEEPS USING THE BUS
+    // until the requester asserts /BGACK. The old condition also released
+    // on (~bg_pin_n & p_as_n & bx_idle), i.e. as soon as /BG went out and
+    // we happened to be idle. Verified in Verilator against the real core:
+    // holding /BR low with that condition deadlocks the bridge completely
+    // -- zero bus cycles, machine dead, not merely slow. Any device that
+    // parks /BR low, or a floating /BR, would hang the accelerator.
+    wire bus_released = ~s_bgack_n[1];
+    wire bus_owned    = ~bus_released;
 
-    // ------------------------------------------------------------------
-    // Halt watchdog: a double-bus-faulted 68000 just halts; on the A500 the
-    // only true recovery is a MACHINE reset (the CIAs must reset so the ROM
-    // overlay at $0 is restored - a CPU-only reset refetches garbage from
-    // chip RAM and faults again forever). So when the core halts, drive the
-    // shared /RST net low for ~25 ms (like Gary's POR), resetting Gary and
-    // the CIAs, then release: overlay restored, vector fetched from ROM,
-    // clean system-wide restart. Turns any guru/cold-boot crash into
-    // authentic self-recovery.
-    reg        auto_rst = 1'b0;
-    reg [21:0] auto_rst_cnt = 22'd0;
+    // ========================================================================
+    // 10. THE BRIDGE (BIU)
+    // ========================================================================
+    // Reproduces a real 68000 bus cycle on the 7M grid:
+    //   S0 (r) FC + R/W high        S1 (f) address valid
+    //   S2 (r) AS low, read DS low  S3 (f) write data driven
+    //   S4 (r) write DS low         S5 (f) <- DTACK/VPA/BERR sample point
+    //   S6 (r)                      S7 (f) latch read data, AS/DS high
+    // Wait states loop S5<->S6 in whole 7M periods, exactly like Sw pairs.
+    // Cycles chain S7->S0 with no bubble, so external throughput is identical
+    // to a stock 68000; only the CPU's internal states run CPU_MULT faster.
+    localparam [3:0] ST_IDLE = 4'd0,  ST_S0   = 4'd1,  ST_S1   = 4'd2,
+                     ST_S2   = 4'd3,  ST_S3   = 4'd4,  ST_S4   = 4'd5,
+                     ST_S5   = 4'd6,  ST_S6   = 4'd7,  ST_S7   = 4'd8,
+                     ST_VPAW = 4'd9,  ST_VPAE = 4'd10, ST_VPAH = 4'd11,
+                     ST_VPAX = 4'd12;
+
+    reg [3:0] st = ST_IDLE;
+    assign bx_idle = (st == ST_IDLE);
+
+    // Latched shadow of the core's cycle
+    reg [23:1] bx_a;
+    reg [2:0]  bx_fc;
+    reg        bx_rw, bx_uds_n, bx_lds_n, bx_iack;
+
+    // Physical pin registers (pack these into IOB — see .fdc / LPF notes)
+    reg [23:1] p_a     = 23'd0;
+    reg [2:0]  p_fc    = 3'd0;
+    reg        p_rw    = 1'b1;
+    reg        p_uds_n = 1'b1;
+    reg        p_lds_n = 1'b1;
+    reg        p_vma_n = 1'b1;
+    reg [15:0] p_d     = 16'd0;
+    reg        p_d_oe  = 1'b0;
+
+    // Sample machinery
+    reg [2:0] smp_cnt = 3'd0;
+    reg       term    = 1'b0;   // this cycle may complete
+    reg       sync_go = 1'b0;   // ... as a 6800 (VPA) cycle instead
+    reg       berr_go = 1'b0;
+
+    // ---- Request queue, 1 deep, EDGE captured --------------------------
+    // The old code used a level: bx_req = ~core_as_n & ~bx_taken, and took
+    // the address/FC/RW snapshot from the core's LIVE outputs at the moment
+    // the bridge started the cycle. That is only safe while the core is
+    // still stalled waiting for our DTACK. The moment we ack it early it
+    // moves on and changes those outputs before we have looked at them --
+    // which is exactly the data corruption that showed up as a green screen
+    // (Chip RAM test failure) on hardware.
+    //
+    // Capturing on the AS falling edge, into a holding register the bridge
+    // owns, decouples the two: the core may negate AS and start composing
+    // its next cycle while we are still running S5/S6/S7 of this one.
+    reg core_as_d = 1'b1;
+    always @(posedge clk) core_as_d <= core_as_n;
+    wire core_as_fall = ~core_as_n &  core_as_d;
+    wire core_as_rise =  core_as_n & ~core_as_d;
+
+    // One ack per BRIDGE cycle. core_dtack_lo alone is not enough: the core
+    // negates AS (clearing it), re-asserts for its next cycle, and the early
+    // ack condition would then fire again while the bridge is still finishing
+    // the PREVIOUS cycle -- acking a request it has not started, with garbage
+    // read data. Cleared at consume, not at the core's AS edge.
+    reg        bx_acked = 1'b0;
+    reg        bx_taken = 1'b0;
+
+    wire bx_req   = ~core_as_n & ~bx_taken;
+    wire bx_start = tick_r & bx_req & bus_owned;
+
+    wire [7:0] av_of_level = 8'd24 + {5'd0, core_a[3:1]};
+
     always @(posedge clk) begin
-        if (!auto_rst) begin
-            auto_rst_cnt <= 22'd0;
-            // trigger: core halted (double fault), not our RESET instruction
-            if (pwrup_done && !core_ohalted_n && core_oreset_n)
-                auto_rst <= 1'b1;
+        if (ext_reset) begin
+            st       <= ST_IDLE;
+            p_as_n   <= 1'b1;
+            p_uds_n  <= 1'b1;
+            p_lds_n  <= 1'b1;
+            p_vma_n  <= 1'b1;
+            p_rw     <= 1'b1;
+            p_d_oe   <= 1'b0;
+            smp_cnt  <= 3'd0;
+            term     <= 1'b0;
+            sync_go  <= 1'b0;
+            berr_go  <= 1'b0;
+            bx_taken <= 1'b0;
+            bx_acked <= 1'b0;
+            core_dtack_lo <= 1'b0;
+            core_berr_lo  <= 1'b0;
+            av_valid      <= 1'b0;
         end else begin
-            auto_rst_cnt <= auto_rst_cnt + 22'd1;
-            if (auto_rst_cnt[21])            // ~24.6 ms at 85.13 MHz
-                auto_rst <= 1'b0;
+            // ---- the core has finished with this cycle -------------------
+            // Core-facing DTACK/BERR are held until the core drops its own
+            // AS, exactly as a real slave does. (Must live in THIS block:
+            // core_dtack_lo is also written by the FSM below, and a second
+            // always block driving it would be a multiple-driver error.)
+            // Edge, not level: with the early ack the core can negate and
+            // re-assert AS inside one of our bus cycles, and a level test
+            // would clear the new cycle's ack as well as the old one's.
+            if (core_as_n) begin
+                bx_taken      <= 1'b0;
+                core_dtack_lo <= 1'b0;
+                core_berr_lo  <= 1'b0;
+                av_valid      <= 1'b0;
+            end
+
+            // ---- read data capture ---------------------------------------
+            // rd_data TRACKS the bus for as long as the slave is driving it
+            // and FREEZES the instant AS negates. The core therefore latches
+            // the value the slave presented at the end of the cycle no matter
+            // which master clock it happens to latch on. This is what makes
+            // ACK_LEAD > 1 safe: without it, acking the core early would let
+            // it sample iEdb before the bridge had captured anything.
+            // Track for as long as WE hold AS asserted, not just in S6. With
+            // the early ack the core can latch iEdb before S6, and a 68000
+            // slave guarantees data valid once it asserts DTACK, so the live
+            // bus is the right thing to present. Still freezes at AS negation.
+            if (bx_rw && ((st == ST_S6) || (st == ST_VPAE && e_pin)))
+                rd_data <= cpu_d;
+
+            // ---- delayed sample of the motherboard's response ------------
+            // Reading the 2FF output DTACK_LAT clocks after the nominal S4
+            // falling edge means we act on the pin value AT that edge: the
+            // exact sample point of a real 68000.
+            if (smp_cnt != 3'd0) begin
+                smp_cnt <= smp_cnt - 3'd1;
+                if (smp_cnt == 3'd1) begin
+                    if (!s_berr_n[1]) begin
+                        berr_go <= 1'b1; term <= 1'b1;
+                    end else if (!s_dtack_n[1]) begin
+                        term <= 1'b1;
+                    end else if (!s_vpa_n[1]) begin
+                        // Gary asserts VPA for CIA space AND for FC=7 (IACK).
+                        // CIA space -> real 6800 cycle against our E.
+                        // IACK      -> terminate here with vector 24+level,
+                        //              which is behaviourally identical to a
+                        //              VPA autovector but needs no E timing
+                        //              and touches no 6800 peripheral. If a
+                        //              Zorro card had supplied DTACK + a real
+                        //              vector we would already have taken the
+                        //              branch above, so vectored interrupts
+                        //              still work.
+                        if (bx_iack && IACK_AV) begin
+                            term     <= 1'b1;
+                            av_valid <= 1'b1;
+                        end else begin
+                            sync_go  <= 1'b1;
+                        end
+                    end
+                end
+            end
+
+            case (st)
+            // ---------------------------------------------------------------
+            ST_IDLE: if (bx_start) begin
+                        p_fc     <= core_fc;
+                        p_rw     <= 1'b1;            // S0: R/W high
+                        bx_a     <= core_a;
+                        bx_fc    <= core_fc;
+                        bx_rw    <= core_rw;
+                        bx_uds_n <= core_uds_n;
+                        bx_lds_n <= core_lds_n;
+                        bx_iack  <= (core_fc == 3'b111);
+                        av_num   <= av_of_level;
+                        av_valid <= 1'b0;
+                        term     <= 1'b0;
+                        sync_go  <= 1'b0;
+                        berr_go  <= 1'b0;
+                        bx_taken <= 1'b1;
+                        bx_acked <= 1'b0;
+                        st       <= ST_S0;
+                     end
+            // ---------------------------------------------------------------
+            ST_S0:  if (tick_f) begin
+                        p_a <= bx_a;                 // S1: address valid
+                        st  <= ST_S1;
+                    end
+            ST_S1:  if (tick_r) begin
+                        p_as_n <= 1'b0;              // S2: AS low
+                        p_rw   <= bx_rw;
+                        if (bx_rw) begin
+                            p_uds_n <= bx_uds_n;     // reads strobe with AS
+                            p_lds_n <= bx_lds_n;
+                        end
+                        st <= ST_S2;
+                    end
+            ST_S2:  if (tick_f) begin
+                        if (!bx_rw) begin            // S3: drive write data
+                            p_d    <= core_dout;
+                            p_d_oe <= 1'b1;
+                        end
+                        st <= ST_S3;
+                    end
+            ST_S3:  if (tick_r) begin
+                        if (!bx_rw) begin            // S4: writes strobe late
+                            p_uds_n <= bx_uds_n;
+                            p_lds_n <= bx_lds_n;
+                        end
+                        st <= ST_S4;
+                    end
+            ST_S4:  if (tick_f) begin                // this IS the S4 fall
+                        smp_cnt <= SMP_N;
+                        st      <= ST_S5;
+                    end
+            ST_S5:  begin
+                        if (EARLY_ACK && !bx_rw && !bx_iack && s_berr_n[1] && s_vpa_n[1]
+                            && !s_dtack_n[1] && !bx_acked) begin
+                            core_dtack_lo <= 1'b1;
+                            bx_acked      <= 1'b1;
+                        end
+                        if (tick_r) st <= ST_S6;
+                    end
+            // ---------------------------------------------------------------
+            ST_S6:  begin
+                        // Lead the data latch so the core has negated and
+                        // re-asserted its AS by our next tick_r -> no bubble.
+                        if (tick_ack && term && !bx_acked) begin
+                            if (berr_go) core_berr_lo  <= 1'b1;
+                            else         core_dtack_lo <= 1'b1;
+                            bx_acked <= 1'b1;
+                        end
+                        // EARLY_ACK: hardware capture (debug_ws.vcd) showed
+                        // the core needs ~16 master clocks from our ack to
+                        // re-asserting AS. Acking at tick_ack leaves only 8
+                        // before the S7 tick_r, so bx_req misses the chain
+                        // window and we sit a whole 7M period in ST_IDLE.
+                        // Even ACK_LEAD=6 only buys 4 of the 9 clocks needed.
+                        // Once DTACK is stable the cycle WILL complete, so
+                        // there is nothing to gain by making the core wait
+                        // for our S-state bookkeeping.
+                        if (EARLY_ACK && !bx_rw && !bx_iack && s_berr_n[1] && s_vpa_n[1]
+                            && !s_dtack_n[1] && !bx_acked) begin
+                            core_dtack_lo <= 1'b1;
+                            bx_acked      <= 1'b1;
+                        end
+                        if (tick_f) begin
+                            if (term) begin
+                                p_as_n  <= 1'b1;   // rd_data froze above
+                                p_uds_n <= 1'b1;
+                                p_lds_n <= 1'b1;
+                                st      <= ST_S7;
+                            end else if (sync_go) begin
+                                st <= ST_VPAW;
+                            end else begin
+                                smp_cnt <= SMP_N;     // Sw pair
+                                st      <= ST_S5;
+                            end
+                        end
+                    end
+            // ---------------------------------------------------------------
+            ST_S7:  if (tick_r) begin
+                        p_rw   <= 1'b1;              // R/W + data held 70 ns
+                        p_d_oe <= 1'b0;              // past AS negation
+                        if (bx_req && bus_owned) begin
+                            p_fc     <= core_fc;
+                            bx_a     <= core_a;
+                            bx_fc    <= core_fc;
+                            bx_rw    <= core_rw;
+                            bx_uds_n <= core_uds_n;
+                            bx_lds_n <= core_lds_n;
+                            bx_iack  <= (core_fc == 3'b111);
+                            bx_taken <= 1'b1;
+                            bx_acked <= 1'b0;
+                            av_num   <= av_of_level;
+                            av_valid <= 1'b0;
+                            term     <= 1'b0;
+                            sync_go  <= 1'b0;
+                            berr_go  <= 1'b0;
+                            st       <= ST_S0;       // chain, no bubble
+                        end else begin
+                            st <= ST_IDLE;
+                        end
+                    end
+            // ---------------------------------------------------------------
+            // 6800-style synchronous cycle, run against OUR 709 kHz E.
+            // AS stays low throughout, exactly as on a real 68000.
+            ST_VPAW: if (tick_r && (e_cnt == E_VMA_AT)) begin
+                        p_vma_n <= 1'b0;             // E low, ~700 ns before rise
+                        st      <= ST_VPAE;
+                     end
+            ST_VPAE: begin
+                        if (tick_ack && (e_cnt == 4'd9)) core_dtack_lo <= 1'b1;
+                        if (tick_f   && (e_cnt == 4'd9)) st <= ST_VPAH;
+                     end
+            ST_VPAH: if (e_fall_tick) st <= ST_VPAX;        // E falls now
+            ST_VPAX: if (tick_f) begin                      // 70 ns of hold
+                        p_vma_n <= 1'b1;
+                        p_as_n  <= 1'b1;
+                        p_uds_n <= 1'b1;
+                        p_lds_n <= 1'b1;
+                        st      <= ST_S7;
+                     end
+            default: st <= ST_IDLE;
+            endcase
+
         end
     end
 
-    // Open-drain RESET / HALT (drive low or release to the board pull-up).
-    // Driven low by the RESET instruction (oRESETn), by a halted core
-    // (oHALTEDn, as real silicon does), or by the halt watchdog above.
-    assign cpu_reset_n = (core_oreset_n  & ~auto_rst) ? 1'bz : 1'b0;
-    assign cpu_halt_n  = (core_ohalted_n & ~auto_rst) ? 1'bz : 1'b0;
+    // ========================================================================
+    // 11. Pin drivers
+    // ========================================================================
+    assign cpu_a     = bus_owned ? (RETIME ? rt_a     : p_a)     : 23'bz;
+    assign cpu_as_n  = bus_owned ? (RETIME ? rt_as_n  : p_as_n)  : 1'bz;
+    assign cpu_uds_n = bus_owned ? (RETIME ? rt_uds_n : p_uds_n) : 1'bz;
+    assign cpu_lds_n = bus_owned ? (RETIME ? rt_lds_n : p_lds_n) : 1'bz;
+    assign cpu_rw    = bus_owned ? (RETIME ? rt_rw    : p_rw)    : 1'bz;
+    assign cpu_fc    = bus_owned ? (RETIME ? rt_fc    : p_fc)    : 3'bz;
+    assign cpu_vma_n = bus_owned ? (RETIME ? rt_vma_n : p_vma_n) : 1'bz;
+    assign cpu_d     = RETIME ? ((bus_owned & rt_d_oe) ? rt_d : 16'bz)
+                              : ((bus_owned & p_d_oe)  ? p_d  : 16'bz);
+    assign cpu_e     = e_pin;         // never tri-stated, as on real silicon
+    assign cpu_bg_n  = bg_pin_n;
 
-    // Autoconfig chain: CFGOUT asserts once our board is configured or shut
-    // up (registered at end-of-cycle inside the shell), then downstream
-    // boards see their CFGIN. Replaces the old transparent pass-through.
-    assign cfgout_n = fm_cfgout_n;
+    reg bus_enable = 1'b0;
+    always @(posedge clk) bus_enable <= pwrup_done & bus_owned;
+    // Open the switchable CBTs on our own cycles so the CPU<->SDRAM traffic
+    // is isolated from the motherboard bus.
+    assign cbt_oe_d0_7_n   = ~bus_enable | fm_active;
+    assign cbt_oe_d8_15_n  = ~bus_enable | fm_active;
+    assign cbt_oe_ctl_hi_n = ~bus_enable;
+    assign cbt_oe_a8_17_n  = ~bus_enable;
+    assign cbt_oe_a1_7_n   = ~bus_enable;
 
-    // ------------------------------------------------------------------
-    // Fastmem cycle-length MEASUREMENT (LED debug, no JTAG needed).
+    // Autoconfig chain: transparent pass-through while our own boards are
+    // stripped out, so downstream cards still configure. REATTACH here.
+
+    // Idled peripherals (ports retained so base64.lpf needs no edit)
+    assign sd_clk      = 1'b0;
+    assign sd_cmd      = 1'bz;
+    assign sd_d        = 4'bzzzz;
+
+    // ========================================================================
+    // 10b. RETIME mode -- SF2000-style pass-through
+    // ========================================================================
+    // The bridge re-synthesises a whole S0..S7 cycle on the 7M grid. That
+    // costs a full 7M period of S0/S1 address setup that the core has ALREADY
+    // done in fast time, plus a quantisation wait in ST_IDLE at the end. Six
+    // clocks per cycle, measured, against a stock 68000's four-plus-wait.
     //
-    // Instead of an absolute AS->DTACK count (whose calibration depends on the
-    // exact fx68k phase alignment), we measure the FULL fastmem read cycle
-    // length: the number of master clocks AS stays low, from AS-fall to
-    // AS-rise. This maps directly to wait states:
-    //   a 68000 read with no wait states = 4 CPU-clock periods = 48 master
-    //   clocks (at 12x); each wait state adds 2 states = 1 CPU period = 12
-    //   master clocks. We report the count in CPU-CLOCK PERIODS (master/12) so
-    //   the LED shows a small number:  4 = zero wait state (ideal, matches
-    //   SRAM), 5 = one wait state (our current case), etc.
+    // Retiming instead just gates the core's OWN strobes onto the 7M grid:
+    //   * AS goes to the motherboard at the first tick_r after the core
+    //     asserts it, and drops immediately when the core drops it
+    //   * UDS/LDS are re-sampled at every tick_r, NOT snapshotted once --
+    //     which is what makes writes work, since a 68000 asserts them two
+    //     clocks after AS on a write
+    //   * DTACK is passed back to the core only ON a tick_r
     //
-    // Display: GREEN blinks the period-count, long pause, repeat. Count the
-    // blinks. 4 blinks = zero wait; 5 blinks = one wait state; and so on.
-    // We latch the MODE-ish value by tracking the MINIMUM full-read length seen
-    // (the best/steady-state open-row-hit case), since occasional misses or
-    // refresh collisions lengthen individual cycles but the fast repeated value
-    // is the one that governs the Dhrystone score.
-    // ------------------------------------------------------------------
-    localparam LAT_DEBUG     = 1'b0;   // 1 = LEDs blink measured cycle length
-    localparam MEASURE_WRITES = 1'b1;  // 1 = measure WRITE cycles, 0 = reads
-    wire meas_dir = MEASURE_WRITES ? ~core_rw : core_rw;
-
-    reg        fm_rd_active;
-    reg [11:0] len_ctr;          // master-clock count of AS-low this cycle
-    reg [11:0] len_min;          // latched best (shortest) full-read length
-    reg        as_n_d;
-    reg        cyc_is_fm_rd;     // this AS-low cycle is a fastmem read
-    always @(posedge clk) as_n_d <= core_as_n;
-    wire as_fall = ~core_as_n & as_n_d;
-    wire as_rise =  core_as_n & ~as_n_d;
+    // That last point is the subtle one, and it is why this is safe where
+    // EARLY_ACK was not. Quantising the ack to the 7M grid gives the slave's
+    // data up to a full 141 ns after DTACK to settle before the core sees
+    // the ack -- the same margin a real 68000 gets from S6 to S7. We are not
+    // removing the margin, we are re-deriving it from the motherboard clock.
+    reg        rt_as_n  = 1'b1, rt_uds_n = 1'b1, rt_lds_n = 1'b1;
+    reg        rt_vma_n = 1'b1, rt_dtack_lo = 1'b0, rt_av = 1'b0;
+    reg [15:0] rt_rd    = 16'hFFFF, rt_d = 16'd0;
+    reg [23:1] rt_a     = 23'd0;
+    reg [2:0]  rt_fc    = 3'd0;
+    reg        rt_rw    = 1'b1, rt_d_oe = 1'b0;
+    reg [1:0]  rt_vst   = 2'd0;
+    reg        core_as_d2 = 1'b1;
+    always @(posedge clk) core_as_d2 <= core_as_n;
 
     always @(posedge clk) begin
-        if (devices_reset) begin
-            fm_rd_active <= 1'b0;
-            len_ctr      <= 12'd0;
-            len_min      <= 12'hFFF;      // start high; min will drop
-            cyc_is_fm_rd <= 1'b0;
+        if (ext_reset) begin
+            rt_as_n <= 1'b1; rt_uds_n <= 1'b1; rt_lds_n <= 1'b1;
+            rt_vma_n <= 1'b1; rt_dtack_lo <= 1'b0; rt_d_oe <= 1'b0;
+            rt_vst <= 2'd0; rt_av <= 1'b0;
+        end else if (core_as_n) begin
+            rt_as_n     <= 1'b1;
+            rt_uds_n    <= 1'b1;
+            rt_lds_n    <= 1'b1;
+            rt_vma_n    <= 1'b1;
+            rt_dtack_lo <= 1'b0;
+            rt_av       <= 1'b0;
+            rt_vst      <= 2'd0;
+            // One clock of address/data hold past AS negation before the
+            // next cycle's address is allowed through.
+            // Address, FC, R/W and the write data are all held one clock
+            // past AS negation. A 68000 keeps R/W and data valid after AS
+            // goes high, and the slave latches a write ON the AS rising
+            // edge -- drop them on the same edge and the write is lost.
+            if (core_as_d2) begin
+                rt_a    <= core_a;
+                rt_fc   <= core_fc;
+                rt_rw   <= 1'b1;
+                rt_d_oe <= 1'b0;
+            end
         end else begin
-            if (as_fall) begin
-                // a new bus cycle starts; is it a fastmem read?
-                cyc_is_fm_rd <= fm_space & meas_dir;
-                fm_rd_active <= fm_space & meas_dir;
-                len_ctr      <= 12'd1;
-            end else if (fm_rd_active) begin
-                if (as_rise) begin
-                    // cycle ended: len_ctr = master clocks AS was low
-                    if (len_ctr < len_min) len_min <= len_ctr;
-                    fm_rd_active <= 1'b0;
-                end else if (len_ctr != 12'hFFF) begin
-                    len_ctr <= len_ctr + 12'd1;
+            if (!core_rw) begin
+                rt_d    <= core_dout;
+                rt_d_oe <= ~rt_as_n;
+            end
+            // R/W, UDS and LDS are RE-SAMPLED every tick_r, never snapshotted
+            // once. A 68000 drives R/W low at S2 (with AS) and the data
+            // strobes at S4 (two clocks after AS) on a write, so anything
+            // captured at the AS edge is stale and the cycle goes out as a
+            // read. That is what turned the Chip RAM test into a green
+            // screen. Until we commit AS, keep tracking R/W so it is stable
+            // at the motherboard before AS falls.
+            // int_space cycles are answered on-chip: never assert AS to the
+            // motherboard for them. This is where the speed comes from --
+            // fast RAM runs at the full 42.6 MHz with no 7M quantisation.
+            if (tick_r && !int_space) begin
+                rt_as_n  <= 1'b0;
+                rt_rw    <= core_rw;
+                rt_uds_n <= core_uds_n;
+                rt_lds_n <= core_lds_n;
+            end else if (rt_as_n) begin
+                rt_rw    <= core_rw;
+            end
+            if (core_rw && !rt_as_n &&
+                (s_vpa_n[1] ? 1'b1 : (!rt_vma_n && e_pin)))
+                rt_rd <= cpu_d;
+            if (tick_r && !rt_as_n && s_berr_n[1]) begin
+                if (!s_dtack_n[1])
+                    rt_dtack_lo <= 1'b1;
+                else if (!s_vpa_n[1] && (core_fc == 3'b111)) begin
+                    rt_av       <= 1'b1;     // IACK -> autovector
+                    rt_dtack_lo <= 1'b1;
+                end
+            end
+            // 6800 cycle against OUR E
+            if (!s_vpa_n[1] && !rt_as_n && (core_fc != 3'b111)) begin
+                if (rt_vst == 2'd0) begin
+                    if (!e_pin && (e_cnt == E_VMA_AT)) begin
+                        rt_vma_n <= 1'b0; rt_vst <= 2'd1;
+                    end
+                end else if (rt_vst == 2'd1) begin
+                    if (e_fall_tick) begin
+                        rt_vma_n <= 1'b1; rt_dtack_lo <= 1'b1; rt_vst <= 2'd2;
+                    end
                 end
             end
         end
     end
 
-    // Convert min master-clock length to CPU-clock PERIODS (divide by 12) for a
-    // small, human-countable number. Round to nearest.
-    wire [7:0] len_periods = (len_min + 12'd6) / 12'd12;
+    // ========================================================================
+    // 10c. Internal slaves: SDRAM fast RAM + its autoconfig
+    // ========================================================================
+    // NOT instantiated: autoconfig_zii (the SD card device). It advertises a
+    // boot ROM -- board type 4'b1101 "ROM vector valid" at offset 00 and a
+    // vector of 0x0001 at offset 2E -- so Kickstart will try to autoboot from
+    // it. With no sd_subsystem behind it that hangs at the boot menu. Bring it
+    // back in the same commit as the SD controller, not before.
+    //
+    // fastmem_zii carries its OWN autoconfig (fm_ac_*), so fast RAM needs only
+    // these two modules and the chain is cfgin -> fastmem -> cfgout.
+    wire        fm_space, fm_active, fm_dtack_n;
+    wire [15:0] fm_dout;
+    wire        fm_ac_access, fm_ac_oe, fm_ac_dtack_n;
+    wire [3:0]  fm_ac_dout;
+    wire        sd_req, sd_we, sd_ack, sd_ready, sd_wr_valid, sd_ack_early;
+    wire [15:0] sd_rdata_live;
+    wire [23:0] sd_saddr;
+    wire [15:0] sd_wdata, sd_rdata;
+    wire [1:0]  sd_byte_en;
 
-    // Blink len_periods on green: N blinks, pause, repeat.
-    reg [23:0] blink_div;
-    reg [3:0]  blink_phase;
-    reg        blink_on;
-    reg        in_pause;
-    reg [25:0] pause_div;
+    wire slave_reset = ext_reset;
+
+    fastmem_zii #(.OFFER_SPLIT(1'b1)) u_fastmem (
+        .clk        (clk),
+        .reset      (slave_reset),
+        .cfgin_n    (s_cfgin_n[1]),
+        .as_n       (core_as_n),
+        .uds_n      (core_uds_n),
+        .lds_n      (core_lds_n),
+        .rw         (core_rw),
+        .a          (core_a),
+        .d_in       (core_dout),
+        .fm_space   (fm_space),
+        .fm_dout    (fm_dout),
+        .fm_dtack_n (fm_dtack_n),
+        .fm_active  (fm_active),
+        .cfgout_n   (cfgout_n),
+        .fm_ac_access (fm_ac_access),
+        .fm_ac_dout   (fm_ac_dout),
+        .fm_ac_oe     (fm_ac_oe),
+        .fm_ac_dtack_n(fm_ac_dtack_n),
+        .req        (sd_req),
+        .we         (sd_we),
+        .saddr      (sd_saddr),
+        .wdata      (sd_wdata),
+        .byte_en    (sd_byte_en),
+        .wr_valid   (sd_wr_valid),
+        .ack        (sd_ack),
+        .ack_early  (sd_ack_early),
+        .rdata_live (sd_rdata_live),
+        .rdata      (sd_rdata),
+        .sdram_ready(sd_ready)
+    );
+
+    wire sdram_clk_int;
+    sdram_ctrl #(.CLK_HZ(85_130_000), .CAS_LAT(2)) u_sdram (
+        .clk (clk), .reset (slave_reset),
+        .req (sd_req), .we (sd_we), .wr_valid (sd_wr_valid),
+        .addr (sd_saddr), .wdata (sd_wdata), .byte_en (sd_byte_en),
+        .ack (sd_ack), .ack_early (sd_ack_early),
+        .rdata_live (sd_rdata_live), .rdata (sd_rdata), .ready (sd_ready),
+        .sdram_a (sdram_a), .sdram_ba (sdram_ba), .sdram_dq (sdram_dq),
+        .sdram_dqm (sdram_dqm), .sdram_clk (sdram_clk_int),
+        .sdram_cke (sdram_cke), .sdram_cs_n (sdram_cs_n),
+        .sdram_ras_n (sdram_ras_n), .sdram_cas_n (sdram_cas_n),
+        .sdram_we_n (sdram_we_n)
+    );
+
+    // SDRAM clock out through an ODDR so it leaves the die on the same path
+    // as the data, rather than through fabric. D0/D1 = 0/1 gives the chip a
+    // clock edge in the middle of our data window; swap them if the memory
+    // proves marginal.
+    ODDRX1F u_sdram_clk (.D0(1'b0), .D1(1'b1), .SCLK(clk),
+                         .RST(1'b0), .Q(sdram_clk));
+
+    // A cycle that never reaches the motherboard.
+    wire int_space = fm_space | fm_ac_access;
+
+    // ========================================================================
+    // 11b. Reveal debug bundle
+    // ========================================================================
+    // syn_keep so none of these get optimised or renamed away -- in Reveal
+    // you can then just add the single net "dbg" and get everything.
+    //
+    //  bit  name            what it tells you
+    //  4:0  ph              position on the 7M grid (0 = tick_r, 6 = tick_f)
+    //  8:5  st              bridge FSM state (0=IDLE, 1..8=S0..S7)
+    //  9    p_as_n          our AS output register
+    // 10    cpu_dtack_n     RAW motherboard DTACK, before the 2FF
+    // 11    s_dtack_n[1]    DTACK after the 2FF (what the FSM acts on)
+    // 12    cpu_vpa_n       RAW VPA (high = normal cycle, low = CIA/IACK)
+    // 13    core_as_n       the core's request
+    // 14    core_dtack_lo   our ack back to the core
+    // 15    bx_req          a cycle is pending in the bridge
+    // 16    bus_owned       we own the bus
+    // 17    s0_enter        one-clock pulse at the start of every bus cycle
+    // 20:18 cpu_a[3:1]      enough address to tell cycles apart
+    // 21    p_rw            read(1)/write(0)
+    // 22    e_pin           our E clock
+    // 23    p_vma_n         our VMA
+    // DBG_BUNDLE=0 removes this entirely. syn_keep forces 24 nets to survive
+    // optimisation, which costs routing and can push a marginal build over
+    // into a Timing Check Error. Turn it off for production builds.
+    (* syn_keep = 1 *) wire [23:0] dbg = !DBG_BUNDLE ? 24'd0 : {
+        p_vma_n, e_pin, p_rw, p_a[3:1], s0_enter, bus_owned,
+        bx_req, core_dtack_lo, core_as_n, cpu_vpa_n, s_dtack_n[1],
+        cpu_dtack_n, p_as_n, st, ph
+    };
+
+    // ========================================================================
+    // 12. LEDs
+    // ========================================================================
+    // Green: E heartbeat (or blinked cycle length when LAT_DEBUG).
+    // Red:   held in reset, OR a sticky 7M phase slip (should never light).
+    // Blue:  bus connected.
+    reg [20:0] e_div = 21'd0;
+    always @(posedge clk) if (e_fall_tick) e_div <= e_div + 21'd1;
+
+    // Shortest observed CYCLE PITCH (S0 -> S0) in 7M clocks.
+    //   4 = perfect, chaining back to back like a stock 68000
+    //   5 = one extra 7M clock somewhere in the handshake
+    // This deliberately measures pitch, NOT AS-low width. AS-low is 2.5
+    // clocks on a no-wait 68000 cycle and tells you nothing about whether
+    // cycles are chaining; pitch is the number that maps onto SysInfo's
+    // chip-speed ratio (4/5 = 0.80).
+    reg [7:0] len_ctr = 8'd0, len_min = 8'hFF;
+    reg       seen_s0 = 1'b0;
+    reg [3:0] st_d    = ST_IDLE;
+    always @(posedge clk) st_d <= st;
+    // Entry into S0, one master clock after the tick_r that caused it.
+    // The previous version tested (tick_r && st == ST_S0), which can NEVER
+    // be true: st is assigned ST_S0 ON that tick_r, so it does not read
+    // back as ST_S0 until the following clock, by which time tick_r is
+    // gone. len_min therefore stayed at its 8'hFF init and the blinker
+    // showed the low nibble, 15. Fifteen blinks means "never measured".
+    wire s0_enter = (st == ST_S0) && (st_d != ST_S0);
     always @(posedge clk) begin
-        if (devices_reset) begin
-            blink_div <= 24'd0; blink_phase <= 4'd0; blink_on <= 1'b0;
-            in_pause <= 1'b1; pause_div <= 26'd0;
-        end else if (in_pause) begin
-            blink_on <= 1'b0;
+        if (ext_reset) begin
+            len_ctr <= 8'd0; len_min <= 8'hFF; seen_s0 <= 1'b0;
+        end else if (s0_enter) begin
+            if (seen_s0 && len_ctr != 8'd0 && len_ctr < len_min)
+                len_min <= len_ctr;
+            len_ctr <= 8'd0;
+            seen_s0 <= 1'b1;
+        end else if (tick_r && seen_s0 && len_ctr < 8'd60) begin
+            len_ctr <= len_ctr + 8'd1;
+        end
+    end
+
+    reg [23:0] blink_div = 24'd0;
+    reg [3:0]  blink_ph  = 4'd0;
+    reg        blink_on  = 1'b0, in_pause = 1'b1;
+    reg [25:0] pause_div = 26'd0;
+    always @(posedge clk) begin
+        if (in_pause) begin
+            blink_on  <= 1'b0;
             pause_div <= pause_div + 26'd1;
             if (pause_div[25]) begin
-                pause_div <= 26'd0;
-                in_pause  <= 1'b0;
-                blink_phase <= 4'd0;
-                blink_div <= 24'd0;
+                pause_div <= 26'd0; in_pause <= 1'b0;
+                blink_ph  <= 4'd0;  blink_div <= 24'd0;
             end
         end else begin
             blink_div <= blink_div + 24'd1;
             if (blink_div == 24'hFFFFFF) begin
                 blink_on <= ~blink_on;
-                if (~blink_on) begin
-                    // transitioning off->on: about to start a blink
-                end else begin
-                    // on->off transition completes one blink
-                    blink_phase <= blink_phase + 4'd1;
-                    if (blink_phase + 4'd1 >= len_periods[3:0])
-                        in_pause <= 1'b1;
+                if (blink_on) begin
+                    blink_ph <= blink_ph + 4'd1;
+                    if (blink_ph + 4'd1 >= len_min[3:0]) in_pause <= 1'b1;
                 end
             end
         end
     end
 
-    // ------------------------------------------------------------------
-    // CBT switches: connect the bus only once locked & powered up. Until the
-    // bitstream loads, ECP5 weak pull-ups hold these high (isolated).
-    // ------------------------------------------------------------------
-    // CBT switches: connect only when powered up AND bus owned. During a
-    // bus grant the switches OPEN, physically isolating D0-15 (U2/U3),
-    // AS/UDS/LDS/RW/A18-23 (U4) and A1-17 (U7/U8). NOTE: FC0-2 (U6) and
-    // VMA (U5) ride ALWAYS-ON switches, so for those two the internal
-    // tristate (drv_bus ? ... : 'bz) is the sole and required protection -
-    // both are implemented above. E and BG (U5) stay driven, as on a real
-    // 68000. All remaining U5/U6 channels are inputs to us. Registered so
-    // the OE pins are glitch-free; the one-clock lag is the safe order on
-    // both edges (pins tristate before the switch opens; the switch closes
-    // before the core can start its next cycle).
-    // CBT isolation: open the switchable buffers (isolate from the mother-
-    // board) when the bus is granted to a DMA master (drv_bus low) OR when we
-    // are running an internal fastmem cycle (fm_active). These two conditions
-    // are mutually exclusive - a DMA master holding the bus generates its own
-    // cycles, so there is no CPU fastmem cycle then - so they compose with a
-    // simple OR. Isolating fastmem cycles keeps pure CPU<->SDRAM traffic off
-    // the 7 MHz bus, which is what lets it run decoupled/fast.
-    // Registered so OE pins are glitch-free; the one-clock lag is safe on both
-    // edges (pins tristate before switches open; switches close before the
-    // core starts its next cycle).
-    reg bus_enable = 1'b0;
-    always @(posedge clk) bus_enable <= pwrup_done & drv_bus & ~fm_active;
-    assign cbt_oe_d0_7_n   = ~bus_enable;
-    assign cbt_oe_d8_15_n  = ~bus_enable;
-    assign cbt_oe_ctl_hi_n = ~bus_enable;
-    assign cbt_oe_a8_17_n  = ~bus_enable;
-    assign cbt_oe_a1_7_n   = ~bus_enable;
-
-    // ------------------------------------------------------------------
-    // Idle module resources (SDRAM/uart still unused in compat mode)
-    // ------------------------------------------------------------------
-    // SDRAM pins are now driven by the sdram_ctrl instance above (fast RAM).
-    // uart still idled.
-    assign uart_tx = 1'b1;
-
-    // ------------------------------------------------------------------
-    // SD slot in SPI mode (replaces the old idle assigns).
-    // CS_n idles high out of reset (slave_select resets 0), so the card
-    // stays deselected until the driver talks to it.
-    // ------------------------------------------------------------------
-    assign sd_clk    = sd_sclk_w;      // SCLK
-    assign sd_cmd    = sd_mosi_w;      // MOSI (always driven; card only
-                                       // listens while CS_n low)
-    assign sd_d[3]   = sd_ss_n_w;      // CS_n
-    assign sd_d[2:1] = 2'bzz;          // unused in SPI mode; pull up in LPF
-    assign sd_d[0]   = 1'bz;           // MISO - input to us
-    assign sd_miso_w = sd_d[0];
-
-    // ------------------------------------------------------------------
-    // Status LEDs. This board's RGB LED is ACTIVE-HIGH (drive 1 to light, 0 to
-    // turn off) - verified empirically on hardware. Ports are named led_r/g/b
-    // (no "_n") to reflect this. green pulses with E (core running), red on
-    // while held in reset, blue = bus isolated.
-    // ------------------------------------------------------------------
-    reg [20:0] e_div;
-    reg e_d;
-    always @(posedge clk) e_d <= core_e;
-    always @(posedge clk) if (core_e & ~e_d) e_div <= e_div + 21'd1;
-    // Normal status LEDs, overridden by the latency-blink display when
-    // LAT_DEBUG is set (green blinks the measured fastmem read latency).
-    assign led_g = LAT_DEBUG ? blink_on       : e_div[20];   // green: blink count = latency, or heartbeat
-    assign led_r = LAT_DEBUG ? 1'b0           : ext_reset;   // red off in debug
-    assign led_b = LAT_DEBUG ? 1'b0           : bus_enable;  // blue off in debug
-
-    // ------------------------------------------------------------------
-    // Phase 3b (not yet enabled): flash_preload streams the driver ROM from
-    // the W25Q256 at 0x100000 into the sd_subsystem BRAM during the pwrup
-    // hold. When enabling: instantiate flash_preload, route its rom_we/
-    // rom_waddr/rom_wdata into sdsys, add flash CS/MOSI/MISO pins (N8/T8/T7)
-    // to the port list + LPF, and gate the hold:
-    //     wire pwrup_done = pwrup_cnt[23] & load_done;
-    // ------------------------------------------------------------------
+    assign led_g = LAT_DEBUG ? blink_on : e_div[20];
+    assign led_r = ph_slip | ~core_ohalted_n;   // PLL slip / double bus fault
+    assign led_b = bus_enable;
 
 endmodule
+
+`default_nettype wire
