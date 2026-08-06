@@ -384,7 +384,15 @@ module base64_top #(
     wire        core_fc0, core_fc1, core_fc2;
     wire        core_bg_n;
     wire [15:0] core_dout;
-    wire [23:1] core_a;
+    // Full 32-bit internal address. The fork drives eab[31:1]; the previous
+    // [23:1] declaration silently DISCARDED A24..A31, which is fine for a
+    // 68000 socket (it has no such pins) but makes anything above 16 MB --
+    // Zorro III space, a mapROM shadow region -- impossible to decode.
+    //
+    // Everything bound for the physical bus still truncates to [23:1], which
+    // is exactly what a real 68000 does. Only the INTERNAL decode sees the
+    // full width.
+    wire [31:1] core_a;
 
     reg         core_dtack_lo = 1'b0;
     reg         core_berr_lo  = 1'b0;
@@ -496,22 +504,17 @@ module base64_top #(
     reg       sync_go = 1'b0;   // ... as a 6800 (VPA) cycle instead
     reg       berr_go = 1'b0;
 
-    // ---- Request queue, 1 deep, EDGE captured --------------------------
-    // The old code used a level: bx_req = ~core_as_n & ~bx_taken, and took
-    // the address/FC/RW snapshot from the core's LIVE outputs at the moment
-    // the bridge started the cycle. That is only safe while the core is
-    // still stalled waiting for our DTACK. The moment we ack it early it
-    // moves on and changes those outputs before we have looked at them --
-    // which is exactly the data corruption that showed up as a green screen
-    // (Chip RAM test failure) on hardware.
+    // ---- Request tracking ----------------------------------------------
+    // bx_req is a LEVEL on the core's AS, and the address/FC/RW snapshot is
+    // taken from the core's live outputs when the bridge starts the cycle.
+    // That is safe only because the core is still stalled waiting for our
+    // DTACK at that moment.
     //
-    // Capturing on the AS falling edge, into a holding register the bridge
-    // owns, decouples the two: the core may negate AS and start composing
-    // its next cycle while we are still running S5/S6/S7 of this one.
-    reg core_as_d = 1'b1;
-    always @(posedge clk) core_as_d <= core_as_n;
-    wire core_as_fall = ~core_as_n &  core_as_d;
-    wire core_as_rise =  core_as_n & ~core_as_d;
+    // An edge-captured 1-deep request queue was tried, to allow acking the
+    // core early. It was REVERTED: R/W goes low at S2 and the data strobes
+    // at S4, so a snapshot taken on the AS falling edge is stale and writes
+    // go out as reads -- a green screen on the Chip RAM test. If you revisit
+    // this, capture R/W and UDS/LDS continuously, not once.
 
     // One ack per BRIDGE cycle. core_dtack_lo alone is not enough: the core
     // negates AS (clearing it), re-asserts for its next cycle, and the early
@@ -611,7 +614,7 @@ module base64_top #(
             ST_IDLE: if (bx_start) begin
                         p_fc     <= core_fc;
                         p_rw     <= 1'b1;            // S0: R/W high
-                        bx_a     <= core_a;
+                        bx_a     <= core_a[23:1];
                         bx_fc    <= core_fc;
                         bx_rw    <= core_rw;
                         bx_uds_n <= core_uds_n;
@@ -709,7 +712,7 @@ module base64_top #(
                         p_d_oe <= 1'b0;              // past AS negation
                         if (bx_req && bus_owned) begin
                             p_fc     <= core_fc;
-                            bx_a     <= core_a;
+                            bx_a     <= core_a[23:1];
                             bx_fc    <= core_fc;
                             bx_rw    <= core_rw;
                             bx_uds_n <= core_uds_n;
@@ -836,7 +839,7 @@ module base64_top #(
             // goes high, and the slave latches a write ON the AS rising
             // edge -- drop them on the same edge and the write is lost.
             if (core_as_d2) begin
-                rt_a    <= core_a;
+                rt_a    <= core_a[23:1];
                 rt_fc   <= core_fc;
                 rt_rw   <= 1'b1;
                 rt_d_oe <= 1'b0;

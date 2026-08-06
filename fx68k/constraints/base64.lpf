@@ -223,3 +223,63 @@ IOBUF PORT "led_g" IO_TYPE=LVCMOS33;
 LOCATE COMP "led_b" SITE "A12";
 IOBUF PORT "led_b" IO_TYPE=LVCMOS33;
 BLOCK JTAGPATHS;
+
+## ---------------------------------------------------------------------
+## MULTICYCLE PREFERENCES
+##
+## Everything above this line is the original pinout, byte for byte.
+## Only the five MULTICYCLE statements below are added.
+##
+## WHY THEY ARE NEEDED
+##
+## Synplify honours set_multicycle_path from base64.fdc -- synthesis
+## reports positive slack with them in force -- but does not forward
+## annotate them to the Lattice preference file. TRACE therefore
+## re-analyses the same paths as single-cycle. That is the whole gap
+## between what synthesis reports and what the .twr reports.
+##
+## NOTE THE SEPARATOR -- opposite of the .fdc:
+##     .fdc  (Synplify)   cpu.excUnit.rAlub_t3      dots
+##     .lpf  (TRACE)      cpu/excUnit/rAlub_t3      slashes
+##
+## All five are enT3 -> enT3 or enT4 -> enT3, verified against the fork's
+## source: four and three master clocks respectively, against the two
+## that "2 X" allows. See section 4 of base64.fdc for the line numbers.
+##
+## HISTORY
+##
+## An earlier version of this was delivered as a SEPARATE file and got
+## used to replace base64.lpf rather than extend it. That wiped the
+## pinout -- "0 out of 111 pins locked", CONFIG_MODE back to JTAG, banks
+## at 2.5V -- and the two builds that froze the Amiga both had that
+## broken pinout. These preferences were blamed at the time and were not
+## the cause; they had never actually been tested. That is why the block
+## now lives inside the pinout file: there is no way to apply it without
+## the LOCATE statements coming along.
+##
+## CHECK AFTER BUILDING, in this order:
+##     Pin Constraint Summary: 111 out of 111 pins locked
+##     CONFIG_MODE  SPI_DUAL   (not JTAG)
+##     hold timing errors: 0
+##
+## The hold check matters. base64.fdc pairs every -setup 2 with -hold 1
+## so the hold edge does not move. The LPF form has no equivalent
+## syntax, so if Diamond shifts the hold check you get hold violations
+## that look like a routing problem. Hold is 0 errors today; if that
+## changes, this block is why.
+## ---------------------------------------------------------------------
+
+MULTICYCLE FROM CELL "cpu/excUnit/U_fx68kAlu/rCcrCore_t3*" TO CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" 2 X ;
+MULTICYCLE FROM CELL "cpu/excUnit/U_fx68kAlu/oper*" TO CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" 2 X ;
+MULTICYCLE FROM CELL "cpu/U_nanoRom_t3/r_rom_q_p1*" TO CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" 2 X ;
+MULTICYCLE FROM CELL "cpu/excUnit/rAlub_t3*" TO CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" 2 X ;
+MULTICYCLE FROM CELL "cpu/excUnit/rAlub_t3*" TO CELL "cpu/excUnit/U_fx68kAlu/rCcrCore_t3*" 2 X ;
+## rCcrCore_t3 is a destination for the nanoROM as well. Missing this
+## one line left 8 errors on the board, worst 0.071 ns.
+MULTICYCLE FROM CELL "cpu/U_nanoRom_t3/r_rom_q_p1*" TO CELL "cpu/excUnit/U_fx68kAlu/rCcrCore_t3*" 2 X ;
+
+## The trailing * on the nanoROM line also catches the syn_maxfan
+## replicas, which appear as r_rom_q_p1_r1[*] and r_rom_q_p1_1[*].
+##
+## DO NOT add one from rAbd_t2. enT2 -> enT3 is adjacent phase slots,
+## one master clock, genuinely single-cycle.

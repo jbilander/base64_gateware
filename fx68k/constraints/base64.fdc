@@ -1,25 +1,42 @@
 # =====================================================================
-# base64_6x.fdc  --  Synplify Pro constraints for the 6x turbo build
+# base64.fdc  --  Synplify Pro constraints for the 6x turbo build
 #
-# WHAT CHANGED vs base64.fdc, and why
+# WHAT CHANGED vs the previous revision
 #
-#   The old file did:
-#       create_clock -name clk_7m ... -period 141.0
-#       set_clock_groups -asynchronous -group clk_12x -group clk_7m
+#   1. Hierarchy separator. Synplify's object namespace uses '.', the
+#      Lattice TRACE report uses '/'. Every set_multicycle_path here was
+#      written with '/' -- copied out of the .twr -- and was therefore
+#      silently rejected with BN105 "Cannot apply constraint". The two
+#      multicycles below had never once been applied. Fixed.
 #
-#   You objected to that line. You were right, but for a better reason
-#   than "the 570 is phase aligned": in this design clk_7m is not a clock
-#   at all. Nothing is clocked by it. It is sampled as DATA by a 2FF
-#   synchroniser running on clk_12x, and every "7M domain" flop is a
-#   clk_12x flop with a clock enable. There is exactly one clock in the
-#   design. So clk_7m must not be declared with create_clock, and once it
-#   is not declared there is no second group to declare asynchronous --
-#   the set_clock_groups line disappears on its own.
+#   2. syn_useioff targets. The p_* registers do not exist. RETIME
+#      defaults to 1 in base64_top.sv, which makes the bridge datapath
+#      dead code, and Synplify prunes p_a / p_d / p_fc / p_rw / p_as_n /
+#      p_uds_n / p_lds_n / p_vma_n before constraints are applied -- that
+#      is the other eight BN105 warnings. The live pin registers are the
+#      rt_* ones. Fixed.
 #
-#   Declaring it as a clock was actively harmful: it made Synplify build a
-#   CDC model for a crossing that does not exist, and the -asynchronous
-#   escape hatch then silently disabled timing analysis on paths that DO
-#   need checking (the bridge's pin registers).
+#   3. Port name. cpu_cfgin_n does not exist; the port is cfgin_n
+#      (base64_top.sv line 156). Fixed.
+#
+#   4. Three more multicycles added, and one deliberately NOT added.
+#      See section 4.
+#
+# HOW TO CHECK THIS FILE ACTUALLY TOOK EFFECT
+#
+#      grep -c BN105 <build log>
+#
+#   must be 0. A rejected constraint is silent apart from that warning:
+#   the build completes, the numbers look plausible, and nothing you
+#   wrote is in force. Check this before reading any other number in the
+#   report.
+#
+#   Second check, unrelated to this file but the same class of mistake:
+#
+#      grep "Pin Constraint Summary" -A1 <build log>
+#
+#   must say 111 out of 111 pins locked. If it says 0, base64.lpf is not
+#   being applied and the FPGA is driving arbitrary physical pins.
 # =====================================================================
 
 # ---------------------------------------------------------------------
@@ -50,27 +67,44 @@ set_false_path -from [get_ports clk_7m]
 # of them land in a 2FF synchroniser (RTL section 2).
 set_false_path -from [get_ports {cpu_dtack_n cpu_vpa_n cpu_berr_n}]
 set_false_path -from [get_ports {cpu_br_n cpu_bgack_n cpu_reset_n cpu_halt_n}]
-set_false_path -from [get_ports {cpu_ipl_n[*] cpu_cfgin_n}]
+set_false_path -from [get_ports {cpu_ipl_n[*] cfgin_n}]
 
 # ---------------------------------------------------------------------
-# 3. Bus pins -- the constraint the old file was missing entirely
+# 3. Bus pins -- IOB packing
 # ---------------------------------------------------------------------
-# The bridge drives these from dedicated pin registers. Pack them into
-# the IOBs: that is what keeps skew between address bits (and between
-# address and AS) down to package/route mismatch instead of fabric
-# routing spread. At 7 MHz the absolute delay is irrelevant -- the SKEW
-# is what Gary and the RAM see.
-define_attribute {i:p_a[*]}    {syn_useioff} {1}
-define_attribute {i:p_d[*]}    {syn_useioff} {1}
-define_attribute {i:p_fc[*]}   {syn_useioff} {1}
-define_attribute {i:p_rw}      {syn_useioff} {1}
-define_attribute {i:p_as_n}    {syn_useioff} {1}
-define_attribute {i:p_uds_n}   {syn_useioff} {1}
-define_attribute {i:p_lds_n}   {syn_useioff} {1}
-define_attribute {i:p_vma_n}   {syn_useioff} {1}
-# p_e omitted on purpose: Synplify reported "Cannot apply constraint
-# syn_useioff to p_e" because it had already absorbed the register into
-# the pad. cpu_e arrives in 3.958 ns, so it is already packed.
+# The retime path drives these from dedicated pin registers. Pack them
+# into the IOBs: that is what keeps skew between address bits (and
+# between address and AS) down to package/route mismatch instead of
+# fabric routing spread. At 7 MHz the absolute delay is irrelevant -- the
+# SKEW is what Gary and the RAM see.
+#
+# These are rt_*, not p_*. With RETIME=1 the bridge path is dead and the
+# p_* registers are pruned during synthesis, so constraining them is a
+# no-op that costs you eight BN105 warnings and no IOB packing.
+# A/B TEST RESULT -- these are back ON, and here is why.
+#
+# Disabling them was an experiment to explain a 3512 -> 3454 Dhrystone
+# drop. It did not explain it: the score stayed at 3454 with packing off,
+# and timing went from 0 setup errors to 40. IOB packing costs nothing and
+# buys closure, so keep it.
+#
+# 3454 is what this design measures with the constraints in force, packed
+# or not. The only build that ever measured 3512 had 301 setup violations
+# and no working constraints at all.
+define_attribute {i:rt_a[*]}    {syn_useioff} {1}
+define_attribute {i:rt_d[*]}    {syn_useioff} {1}
+define_attribute {i:rt_fc[*]}   {syn_useioff} {1}
+define_attribute {i:rt_rw}      {syn_useioff} {1}
+define_attribute {i:rt_as_n}    {syn_useioff} {1}
+define_attribute {i:rt_uds_n}   {syn_useioff} {1}
+define_attribute {i:rt_lds_n}   {syn_useioff} {1}
+define_attribute {i:rt_vma_n}   {syn_useioff} {1}
+
+# Do NOT use "define_global_attribute syn_useioff 1" as a shortcut. It
+# packs INPUT registers as well as outputs. This design deliberately
+# samples clk_7m on the NEGEDGE of clk_12x and PHASE_OFS is calibrated
+# against that capture point; moving it into an input IOB moves the
+# sample instant.
 
 # DO NOT add set_output_delay here. The first build did, and it was wrong:
 #
@@ -95,12 +129,6 @@ define_attribute {i:p_vma_n}   {syn_useioff} {1}
 # falls a deliberate 70 ns after the address is valid, that is not a
 # timing problem in any sense that reaches the motherboard.
 #
-# The ~2.2 ns that cpu_a costs over cpu_e is the tri-state enable path
-# (two LUTs) plus the BB buffer with SLEWRATE=SLOW from base64.lpf. The
-# slow slew rate is deliberate -- it is there to keep the edges civil on a
-# long unterminated backplane -- and trading it for timing margin you do
-# not need would be a bad trade.
-#
 # If you ever do want a real output constraint, the honest form is a
 # max-delay to the pin, not a setup relative to a clock the far end has
 # never heard of:
@@ -113,62 +141,104 @@ define_attribute {i:p_vma_n}   {syn_useioff} {1}
 # Every fx68k flop is clocked by clk_12x and gated by enPhi1 or enPhi2.
 # STA therefore demands that EVERY path close in one master clock period
 # (11.64 ns) unless you tell it otherwise. The real settling time
-# available depends on which enable is at each end:
-#
-#   at CLK_MULT=12, CPU_MULT=6  (MC4 = 2 master clocks per CPU period)
-#     phi1 -> phi2 :  1 master clock  = 11.64 ns   <-- CANNOT be relaxed
-#     phi2 -> phi1 :  1 master clock  = 11.64 ns   <-- CANNOT be relaxed
-#     phi1 -> phi1 :  2 master clocks = 23.28 ns   <-- multicycle 2
-#     phi2 -> phi2 :  2 master clocks = 23.28 ns   <-- multicycle 2
-#
-# So the hard requirement is that fx68k's phi1->phi2 logic closes at
-# 85.9 MHz. No constraint can buy you out of that, and neither can a
-# faster master clock (see DESIGN_NOTES_6x.md section "Why not 24x").
-#
-# UPDATE -- the first build settled this. Only TWO paths fail, by 0.020 ns
-# and 0.001 ns, and both are legitimately multicycle. From your fork:
+# available depends on which enable is at each end. From your fork:
 #
 #   enT1 = enPhi1 & tState[T4] & ~wClk
 #   enT2 = enPhi2 & tState[T1]
 #   enT3 = enPhi1 & tState[T2]
 #   enT4 = enPhi2 & (tState[T0] | tState[T3])
 #
-# so the four T slots land phi1,phi2,phi1,phi2 and a full microcycle is
-# 4 master clocks at CPU_MULT=6. The two failing paths are:
+# so the four T slots land phi1, phi2, phi1, phi2 and a full microcycle is
+# 4 master clocks at CPU_MULT=6:
 #
-#   rCcrCore_t3 (enT3) -> rPswCcr_t3 (enT3)   T3->T3, a whole microcycle
-#                                             = 4 master clocks = 46.6 ns
-#   oper        (enT4) -> rPswCcr_t3 (enT3)   T4->T3, three T slots
-#                                             = 3 master clocks = 34.9 ns
+#   T1 -> T2, T2 -> T3, T3 -> T4, T4 -> T1   1 master clock  <-- CANNOT relax
+#   T4 -> T3                                 3 master clocks
+#   T3 -> T3                                 4 master clocks
 #
-# Both are being held to 11.64 ns, i.e. over-constrained by 3-4x. The
-# 0.020 ns "failure" is meaningless. These two are safe to relax, and
-# -setup 2 is deliberately conservative against a real 3-4.
+# VERIFIED ENABLES -- read these out of the fork before trusting the list.
+# Every one below was checked against source, not inferred from the name:
+#
+#   rCcrCore_t3             enT3   fx68kAlu.sv:529, inside "if (enT3)"
+#   rPswCcr_t3              enT3   fx68kAlu.sv:544/546, inside "if (enT3)"
+#   rAlub_t3                enT3   fx68k.sv:1920, inside "if (enT3)"
+#   U_nanoRom_t3 r_rom_q_p1 enT3   fx68kRom_generic, .clk_ena(enT3)
+#   oper                    enT4   fx68kAlu.sv:157, inside "if (enT4)"
+#   rAbd_t2                 enT2   fx68k.sv:1640, inside "if (enT2)"
+#
+# The nanoROM one is the important find. Its output register is enabled by
+# enT3 -- the SAME enable as the destination -- so the deepest path in the
+# design (17 logic levels, nanoROM -> ALU shifter -> carry chain -> CCR)
+# is T3 -> T3 and gets a whole microcycle. It was being held to a quarter
+# of that, and it is the worst endpoint in every report.
 
 set_multicycle_path -setup 2 -hold 1 \
-    -from [get_cells {cpu/excUnit/U_fx68kAlu/rCcrCore_t3*}] \
-    -to   [get_cells {cpu/excUnit/U_fx68kAlu/rPswCcr_t3*}]
+    -from [get_cells {cpu.excUnit.U_fx68kAlu.rCcrCore_t3*}] \
+    -to   [get_cells {cpu.excUnit.U_fx68kAlu.rPswCcr_t3*}]
 
 set_multicycle_path -setup 2 -hold 1 \
-    -from [get_cells {cpu/excUnit/U_fx68kAlu/oper*}] \
-    -to   [get_cells {cpu/excUnit/U_fx68kAlu/rPswCcr_t3*}]
+    -from [get_cells {cpu.excUnit.U_fx68kAlu.oper*}] \
+    -to   [get_cells {cpu.excUnit.U_fx68kAlu.rPswCcr_t3*}]
 
+set_multicycle_path -setup 2 -hold 1 \
+    -from [get_cells {cpu.U_nanoRom_t3.r_rom_q_p1*}] \
+    -to   [get_cells {cpu.excUnit.U_fx68kAlu.rPswCcr_t3*}]
+
+set_multicycle_path -setup 2 -hold 1 \
+    -from [get_cells {cpu.excUnit.rAlub_t3*}] \
+    -to   [get_cells {cpu.excUnit.U_fx68kAlu.rPswCcr_t3*}]
+
+# rCcrCore_t3 is a DESTINATION as well as a source. It only surfaces once
+# the louder paths above are relaxed.
+set_multicycle_path -setup 2 -hold 1 \
+    -from [get_cells {cpu.excUnit.rAlub_t3*}] \
+    -to   [get_cells {cpu.excUnit.U_fx68kAlu.rCcrCore_t3*}]
+
+# ...and so is the nanoROM. Both sources feed both CCR destinations; the
+# four combinations have to be stated separately. Leaving this one out
+# left 8 P&R errors, worst 0.071 ns, on an otherwise clean board.
+set_multicycle_path -setup 2 -hold 1 \
+    -from [get_cells {cpu.U_nanoRom_t3.r_rom_q_p1*}] \
+    -to   [get_cells {cpu.excUnit.U_fx68kAlu.rCcrCore_t3*}]
+
+# The trailing * on the nanoROM -from also catches the replicas that
+# syn_maxfan creates (r_rom_q_p1_r1[*], _r2[*], ...).
+#
+# DO NOT add a multicycle from rAbd_t2. That is enT2 -> enT3: adjacent
+# phase slots, one master clock, genuinely single-cycle. It is the real
+# critical path once everything above is relaxed, and a multicycle there
+# buys you a build that passes STA and fails on hardware.
+#
 # NOTE the -hold 1 companion on each. A -setup N without a matching
 # -hold N-1 moves the hold check to the wrong edge and produces hold
 # violations that look like a routing problem and are not. Hold currently
 # passes with 0 errors -- check it still does after adding these.
 #
-# Do NOT generalise these to a blanket cpu/* form. T1->T2, T2->T3,
-# T3->T4 and T4->T1 really do have only one master clock, and relaxing
-# them would give you a build that passes STA and fails on hardware.
+# Do NOT generalise these to a blanket cpu.* form.
+
+# ---------------------------------------------------------------------
+# 4b. Replication on the tight path
+# ---------------------------------------------------------------------
+# rAbd_t2 -> rPswCcr_t3 cannot be relaxed by constraint, so the only
+# levers are replication, placement and clock rate. The CCR Z flag is a
+# wide reduction over the whole ALU result: the endpoint has high fanin
+# while these drivers have high fanout, so duplicating the drivers
+# shortens the routes without touching fx68k's logic.
+#
+# Note that fx68k marks rPswCcr_t3 with syn_allow_retiming=0 and
+# syn_replicate=0, so the ENDPOINT cannot be duplicated. Only the drivers
+# are available.
+#
+# The design uses 40% of the SLICEs, so the area this costs is free.
+define_attribute {i:cpu.U_nanoRom_t3.r_rom_q_p1*} {syn_maxfan} {8}
+define_attribute {i:cpu.excUnit.rAbd_t2*}         {syn_maxfan} {8}
 
 # ---------------------------------------------------------------------
 # 5. Bridge <-> core
 # ---------------------------------------------------------------------
 # These are ordinary single-clock paths and must be analysed normally.
 # Listed here only to make it explicit that they are NOT false paths --
-# the old -asynchronous group would have swallowed them.
-#   bridge FSM  -> pin registers        : real, constrained in section 3
-#   sync flops  -> bridge FSM           : real
-#   bridge      -> core_dtack_lo/rd_data: real, and the tightest of the
+# an -asynchronous clock group would have swallowed them.
+#   retime FSM  -> pin registers        : real, constrained in section 3
+#   sync flops  -> retime FSM           : real
+#   retime      -> rt_dtack_lo/rt_rd    : real, and the tightest of the
 #                                         three because of ACK_LEAD

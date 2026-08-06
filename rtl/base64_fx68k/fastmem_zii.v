@@ -41,7 +41,7 @@ module fastmem_zii #(
     input  wire        uds_n,
     input  wire        lds_n,
     input  wire        rw,           // 1 = read
-    input  wire [23:1] a,
+    input  wire [31:1] a,      // FULL internal address, not just the socket's
     input  wire [15:0] d_in,         // core write data (oEdb)
 
     // ---- to base64_top muxes ----
@@ -81,6 +81,10 @@ reg [7:0]  addr_match;   // owned 1 MB slots in $2..$9
 
 // state order: SPLIT requires offering 2M before 4M (KS config-overflow bug,
 // per gottagofast). Non-split just walks 8->4->2->1.
+// Set 0 to drop the $08000000 window and leave the design exactly as it
+// was: Z2 only, 8 MB, nothing decoded above 16 MB.
+parameter  CPUSPACE_EN = 1'b1;
+
 localparam OFFER_8M = 3'd0,
            OFFER_4M = 3'd1,
            OFFER_2M = 3'd2,
@@ -91,7 +95,10 @@ localparam OFFER_8M = 3'd0,
 wire ds_n = uds_n & lds_n;
 
 // autoconfig region: $E8xxxx while unconfigured and CFGIN low
-wire ac_access = !cfgin_n && cfgout_n && (a[23:16] == 8'hE8) && !as_n;
+// Autoconfig lives in Zorro II space, so it must NOT match when the upper
+// address bits are set -- otherwise $01E8xxxx and friends alias onto it.
+wire ac_access = !cfgin_n && cfgout_n && (a[31:24] == 8'h00)
+                 && (a[23:16] == 8'hE8) && !as_n;
 wire ac_read   = ac_access && rw && !ds_n;
 
 // ---- autoconfig slave outputs ----
@@ -255,11 +262,66 @@ end
 // slot index = A[23:20] - 2  (region $2..$9 -> slot 0..7)
 // ---------------------------------------------------------------------------
 wire [3:0] region = a[23:20];
-wire       in_window = configured && (region >= 4'h2) && (region <= 4'h9);
+// Same guard for the memory window. With a 24-bit address this was
+// unnecessary; with 32 bits it is the difference between owning $200000 and
+// owning every $xx200000 in the map.
+wire       in_window = configured && (a[31:24] == 8'h00)
+                       && (region >= 4'h2) && (region <= 4'h9);
 wire [2:0] slot = region[2:0] - 3'd2;     // 0..7
 wire       owns = in_window && addr_match[slot];
 
-assign fm_space  = owns && !as_n;
+// ---------------------------------------------------------------------------
+// CPU-socket 32-bit fast RAM -- 16 MB at $08000000-$08FFFFFF
+//
+// This is where CPU-socketed and A1200 turbocards conventionally put their
+// RAM. Deliberately NOT autoconfig: the region is decoded here and answered
+// internally, with no bus negotiation at all. That sidesteps the open
+// question of whether expansion.library will place a Zorro III board above
+// 16 MB on a machine whose exec believes it has a 68000.
+//
+// NOT gated on `configured`. Autoconfig has nothing to do with this window;
+// it is live from reset. fm_req_now already gates on sdram_ready, so an
+// access before SDRAM init simply waits rather than returning rubbish.
+//
+// THE OS WILL NOT SEE THIS MEMORY BY ITSELF. Nothing advertises it. It has
+// to be handed to exec with AddMemList(size, MEMF_FAST|MEMF_PUBLIC, pri,
+// 0x08000000, name) -- from a startup-sequence tool to prove the decode,
+// or from a boot ROM later for a proper job.
+//
+// Software caveat, the same one every accelerator has: code that stores
+// flags in the top byte of a pointer (harmless on a real 68000, which
+// ignores A31-A24) breaks with memory up here. That is the argument for
+// keeping the 8 MB Z2 window as well -- old software gets 24-bit-safe
+// memory, new software gets the big pool.
+wire       cpu_win = CPUSPACE_EN && (a[31:24] == 8'h08);
+
+// ---------------------------------------------------------------------------
+// REGISTERED WINDOW DECODE
+//
+// fm_space gates fm_req_now, which reaches the SDRAM controller's S_IDLE
+// logic and from there the RAS/CAS/WE command registers. Driving it
+// straight from the address put two eight-bit comparators -- a[31:24]==$00
+// for the Z2 window and a[31:24]==$08 for this one -- plus the slot decode
+// plus the controller's row compare into a single 85 MHz clock. P&R
+// reported it as aob[24], aob[28] and aob[29] failing to sdram_ras.
+//
+// This is the same trap that saddr_r below already documents, and it cost
+// 2992 -> 1354 Dhrystones the first time. Registering is safe for exactly
+// the same reason given there: the 68000 presents the address at S1, two
+// master clocks before AS falls, so a one-clock-old decode is still
+// current when as_n arrives -- and it leaves a full clock of margin.
+//
+// sdram_word deliberately keeps the COMBINATIONAL cpu_win. It feeds
+// saddr_r, which is itself a register, so that path is already a normal
+// one-clock hop; using the registered copy there would put the address
+// two clocks behind and eat the whole margin.
+reg owns_r, cpu_win_r;
+always @(posedge clk) begin
+    owns_r    <= owns;
+    cpu_win_r <= cpu_win;
+end
+
+assign fm_space  = (owns_r || cpu_win_r) && !as_n;
 
 // OPT A: combinational request. Reads start when DS is valid (on a 68000 read
 // DS asserts with AS, so effectively immediately); writes start at decode time
@@ -305,7 +367,23 @@ endfunction
 wire [3:0] dense_mb = popcount_below(addr_match, slot);   // which MB in SDRAM
 // SDRAM WORD address: {dense_mb (which 1MB), A[19:1] within the MB}
 // 1 MB = 512K words -> 19-bit word offset = A[19:1].
-wire [23:0] sdram_word = {1'b0, dense_mb, a[19:1]};
+//
+// SDRAM MAP (32 MB device, 16M words):
+//
+//   words 0x000000-0x3FFFFF   bytes  0- 8 MB   Z2 fast RAM, $00200000
+//   words 0x400000-0x47FFFF   bytes  8- 9 MB   RESERVED: mapROM shadow
+//   words 0x480000-0x7FFFFF   bytes  9-16 MB   spare
+//   words 0x800000-0xFFFFFF   bytes 16-32 MB   CPU space, $08000000
+//
+// The CPU-space mapping is deliberately the top half of the device so it
+// needs no adder: {1'b1, a[23:1]} covers 16 MB with a single constant bit,
+// and cannot collide with the Z2 block, which always has bit 23 clear.
+//
+// The mapROM MB is reserved here rather than left to chance so that a
+// later ROM-shadow implementation has somewhere to live that no window
+// can reach. Nothing decodes it yet; it is simply not handed to anything.
+wire [23:0] sdram_word = cpu_win ? {1'b1, a[23:1]}
+                                 : {1'b0, dense_mb, a[19:1]};
 
 // ---------------------------------------------------------------------------
 // Bus <-> controller bridge FSM.
