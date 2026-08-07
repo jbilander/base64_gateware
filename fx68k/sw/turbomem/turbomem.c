@@ -71,6 +71,8 @@
  * to ask for DMA-safe memory with. */
 #define TURBO_PRI    (-5)
 
+static const char TURBO_NAME[] = "turbo memory";
+
 /* exec.library LVO. VERIFY THIS against the NDK before trusting it --
  * a wrong LVO here jumps into a neighbouring function with our arguments
  * in the registers, which is a far more entertaining failure than a
@@ -98,7 +100,9 @@ static void call_AddMemList(struct ExecBase *sysbase,
 }
 
 /* AllocMem is exec LVO -198, V33, not poisoned. Same explicit-register
- * form as call_AddMemList and for the same reason. */
+ * form as call_AddMemList and for the same reason. CLI build only -- the
+ * ROM has no use for it, see the note at the call site. */
+#ifdef TURBOMEM_CLI
 #define LVO_AllocMem  (-198)
 
 static APTR call_AllocMem(struct ExecBase *sysbase, ULONG size, ULONG reqs)
@@ -119,6 +123,7 @@ static APTR call_AllocMem(struct ExecBase *sysbase, ULONG size, ULONG reqs)
      * pass anything in it. */
     return ret;
 }
+#endif /* TURBOMEM_CLI */
 
 /* Probe offsets. The failure this is really hunting is ALIASING -- a
  * window that decodes fewer address bits than it claims wraps, and a
@@ -179,34 +184,39 @@ ULONG turbomem_add(struct ExecBase *sysbase)
     }
 
     /* AddMemList STORES THE NAME POINTER, it does not copy the string.
-     * Point it at our own .rodata and the MemHeader's ln_Name dangles the
-     * moment this program exits and DOS frees its segments -- which is
-     * why yKick's AddMem allocates a copy before calling. Same here: this
-     * block is deliberately never freed, because exec now owns it.
      *
-     * In the ROM build the image is copied to RAM by expansion.library and
-     * kept for the life of the machine, so the literal would be safe
-     * there -- but doing it the same way in both keeps one code path. */
+     * CLI build: the string lives in the program's own .rodata, which DOS
+     * frees when the program exits, leaving the MemHeader's ln_Name
+     * dangling. yKick's AddMem allocates a copy for exactly this reason,
+     * so we do too, and deliberately never free it -- exec owns it now.
+     *
+     * ROM build: expansion.library copies the image to RAM and keeps it
+     * for the life of the machine, so the literal is already permanent.
+     * Allocating would be pointless, and worse, it would put an AllocMem
+     * call inside DiagPoint -- a library call during expansion.library's
+     * own configuration walk, which is not somewhere to be doing
+     * unnecessary work. */
+#ifdef TURBOMEM_CLI
     {
-        static const char nm[] = "turbo memory";
-        UBYTE *heap = (UBYTE *)call_AllocMem(sysbase, sizeof(nm),
+        UBYTE *heap = (UBYTE *)call_AllocMem(sysbase, sizeof(TURBO_NAME),
                                              MEMF_PUBLIC | MEMF_CLEAR);
         ULONG k;
-        CONST_STRPTR use = (CONST_STRPTR)nm;
+        CONST_STRPTR use = (CONST_STRPTR)TURBO_NAME;
 
         if (heap) {
-            for (k = 0; k < sizeof(nm); k++)
-                heap[k] = (UBYTE)nm[k];
+            for (k = 0; k < sizeof(TURBO_NAME); k++)
+                heap[k] = (UBYTE)TURBO_NAME[k];
             use = (CONST_STRPTR)heap;
         }
 
-        call_AddMemList(sysbase,
-                        TURBO_SIZE,
-                        MEMF_FAST | MEMF_PUBLIC,
-                        TURBO_PRI,
-                        (APTR)TURBO_BASE,
-                        use);
+        call_AddMemList(sysbase, TURBO_SIZE, MEMF_FAST | MEMF_PUBLIC,
+                        TURBO_PRI, (APTR)TURBO_BASE, use);
     }
+#else
+    call_AddMemList(sysbase, TURBO_SIZE, MEMF_FAST | MEMF_PUBLIC,
+                    TURBO_PRI, (APTR)TURBO_BASE,
+                    (CONST_STRPTR)TURBO_NAME);
+#endif
 
     return 0;
 }

@@ -149,8 +149,22 @@ $(ROMDIR)/turbomem.elf: turbomem.c turbomem.ld | $(ROMDIR)
 	    -Wl,-Map=$(ROMDIR)/turbomem.map
 	$(OBJDUMP) -D $@ > $(ROMDIR)/turbomem.s
 
+# Pad to a whole number of 16-bit words.
+#
+# The image came out 167 bytes: .text 0x7e plus .rodata 0x29. hexdump's
+# "2/1" format then read a single byte on its last iteration and emitted a
+# two-character line, which $readmemh parses as a small value and loads
+# into the wrong half of the final word -- quietly corrupting the last
+# byte of the name string. Padding with a zero byte keeps every line four
+# characters wide. Harmless to the ROM itself, since da_Size states the
+# real length.
 $(ROMDIR)/turbomem.bin: $(ROMDIR)/turbomem.elf
 	$(OBJCOPY) -O binary $< $@
+	@sz=$$(stat -c%s $@); \
+	 if [ $$((sz % 2)) -ne 0 ]; then \
+	   printf '\0' >> $@; \
+	   echo "    padded 1 byte for word alignment"; \
+	 fi
 	@echo "--> $@  $$(stat -c%s $@) bytes"
 
 # One 16-bit word per line, big-endian, which is both what the 68000
@@ -160,7 +174,11 @@ $(ROMDIR)/turbomem.bin: $(ROMDIR)/turbomem.elf
 # ROM with every halfword swapped.
 $(ROMDIR)/turbomem.mem: $(ROMDIR)/turbomem.bin
 	hexdump -v -e '2/1 "%02x" "\n"' $< > $@
-	@echo "--> $@  $$(wc -l < $@) words"
+	@bad=$$(grep -cvE '^[0-9a-f]{4}$$' $@ || true); \
+	 if [ "$$bad" -ne 0 ]; then \
+	   echo "*** $$bad malformed line(s) - not 4 hex digits ***"; exit 1; \
+	 fi
+	@echo "--> $@  $$(wc -l < $@) words, all 4 digits"
 
 install-mem: $(ROMDIR)/turbomem.mem
 	cp $< $(RTLDIR)/turbomem.mem
