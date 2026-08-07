@@ -43,5 +43,11 @@ SECTIONS
         *(.bss .bss.* COMMON)
     }
 
+    /* Image size, for the DiagArea's da_Size. Works because the script
+     * starts at 0, so the end address IS the length. .data and .bss are
+     * empty by construction -- check-pic enforces that -- so this lands
+     * immediately after .rodata. */
+    __rom_end = .;
+
     /DISCARD/ : { *(.comment) *(.note*) }
 }

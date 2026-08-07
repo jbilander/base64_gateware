@@ -221,6 +221,100 @@ ULONG turbomem_add(struct ExecBase *sysbase)
     return 0;
 }
 
+/* ==================================================================== */
+/* ROM build: DiagArea header + DiagPoint                               */
+/* ==================================================================== */
+#ifndef TURBOMEM_CLI
+
+#include <libraries/configregs.h>
+
+/* Set 1 for bring-up: DiagPoint returns without touching anything, which
+ * proves the FPGA ROM window and the autoconfig entry in isolation. Set 0
+ * once the board enumerates and DiagPoint is demonstrably reached. */
+#ifndef DIAG_STUB
+#define DIAG_STUB 0
+#endif
+
+/* The header MUST be at offset 0 -- er_InitDiagVec points at it. It goes
+ * in .text.entry, which turbomem.ld places ahead of everything else; the
+ * same mechanism that puts _start first in the CLI build.
+ *
+ * FIELD NOTES, from libraries/configregs.h:
+ *
+ *   er_InitDiagVec is a WORD offset from the board base, so a vector of
+ *   $0001 means byte 2. Set the autoconfig nibbles accordingly.
+ *
+ *   da_Size and both code offsets are relative to the image AFTER it has
+ *   been copied to RAM and de-nibbleized -- "the size of the actual
+ *   information, not how much address space is required to store it".
+ *   With DAC_WORDWIDE those are the same thing, which is one more reason
+ *   to use it.
+ *
+ *   DAC_BYTEWIDE carries "BUG: Will not work under V34 Kickstart!" in the
+ *   header, and V34 is 1.3. DAC_WORDWIDE it is.
+ *
+ *   da_BootPoint is zero, so the boot-time field is DAC_NEVER (0x00) and
+ *   da_Config is just DAC_WORDWIDE.
+ *
+ * __rom_end comes from the linker script and equals the image size,
+ * because the script starts at 0. */
+asm(
+"       .section .text.entry,\"ax\"\n"
+"       .globl  diag_area\n"
+"diag_area:\n"
+"       .byte   0x80\n"                     /* da_Config: DAC_WORDWIDE  */
+"       .byte   0\n"                        /* da_Flags                 */
+"       .word   __rom_end\n"                /* da_Size                  */
+"       .word   diag_point - diag_area\n"   /* da_DiagPoint             */
+"       .word   0\n"                        /* da_BootPoint: none       */
+"       .word   diag_name - diag_area\n"    /* da_Name                  */
+"       .word   0\n"                        /* da_Reserved01            */
+"       .word   0\n"                        /* da_Reserved02            */
+"       .text\n"
+"diag_name:\n"
+"       .asciz  \"turbo memory\"\n"
+"       .even\n"
+);
+
+/* Calling convention, verbatim from configregs.h:
+ *
+ *   A7  at least 2K of stack
+ *   A6  ExecBase
+ *   A5  ExpansionBase
+ *   A3  your board's ConfigDev
+ *   A2  base of the diag/init area that was copied
+ *   A0  base of your board
+ *
+ * SysBase is read from address 4 rather than taken from A6: the build
+ * uses -ffixed-a6, so binding a parameter to it is asking for trouble,
+ * and address 4 is authoritative anyway.
+ *
+ * RETURN VALUE IS NOT A SUCCESS FLAG. Per the header, returning NULL
+ * tells expansion.library to hand the copied area back to the free memory
+ * pool. Nothing here needs to persist after the call, so zero would be
+ * correct and tidier -- but during bring-up return non-zero, so a freed
+ * copy cannot muddy the picture if something else goes wrong. */
+ULONG diag_point(void);
+
+ULONG diag_point(void)
+{
+#if DIAG_STUB
+    return 1;
+#else
+    struct ExecBase *sysbase;
+
+    asm volatile ("move.l 4.w,%0" : "=r"(sysbase));
+
+    /* Ignore the result. There is nowhere to report a failed probe from
+     * here, and adding nothing is the correct outcome either way. */
+    (void)turbomem_add(sysbase);
+
+    return 1;
+#endif
+}
+
+#endif /* !TURBOMEM_CLI */
+
 /* ------------------------------------------------------------------ */
 /* CLI harness. Everything below is excluded from the ROM build.      */
 /* ------------------------------------------------------------------ */

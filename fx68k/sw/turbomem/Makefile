@@ -78,6 +78,12 @@ CFLAGS    = -m68000 -Wall -Wextra -Wno-unused-parameter \
 # have run where it was copied and read its data from where it was
 # linked. Range is +/-32K, which a ROM this size is nowhere near.
 ROMFLAGS  = -mpcrel
+
+# make rom DIAG_STUB=1  -> DiagPoint returns immediately, touching nothing.
+# Use it to prove the FPGA ROM window and the autoconfig entry on their
+# own, before the payload is in the picture.
+DIAG_STUB ?= 0
+DIAGFLAGS  = -DDIAG_STUB=$(DIAG_STUB)
 # --emit-relocs IS REQUIRED FOR THE HUNK BUILD.
 #
 # DOS loads a hunk executable wherever it likes and fixes up absolute
@@ -94,7 +100,21 @@ ROMFLAGS  = -mpcrel
 #
 # simple.device's Makefile has this flag. It belongs in LDFLAGS so both
 # the test and ROM builds get it, not just the ROM.
-LDFLAGS   = -nostdlib -nostartfiles -T turbomem.ld -Wl,--emit-relocs
+LDFLAGS   = -nostdlib -nostartfiles -T turbomem.ld
+
+# --emit-relocs on the TEST build only. DOS loads a hunk wherever it likes
+# and fixes up absolute references from HUNK_RELOC32 entries, which
+# elf2hunk can only produce if the ELF still carries its relocations.
+# Without it "lea 60,a1" for the dos.library string still says $60 after
+# DOS has loaded the program at $23C010, OpenLibrary gets a pointer into
+# the exception vector table, and the program exits silently. That was
+# Guru 81000005, then an empty prompt on 3.1.4 and a hang on 1.3.
+#
+# The ROM must NOT have it: objcopy discards relocations anyway, and their
+# presence would defeat check-pic, which is the thing proving the image is
+# position independent.
+TESTLD    = $(LDFLAGS) -Wl,--emit-relocs
+ROMLD     = $(LDFLAGS)
 
 .PHONY: all test rom hello check-lvo check-pic check-a6 check-entry check-relocs install-mem clean
 all: test
@@ -108,7 +128,7 @@ $(TESTDIR):
 	@mkdir -p $@
 
 $(TESTDIR)/TestAddTurboMem: turbomem.c turbomem.ld | $(TESTDIR)
-	$(CC) $(CFLAGS) -DTURBOMEM_CLI -o $@.elf turbomem.c $(LDFLAGS) \
+	$(CC) $(CFLAGS) -DTURBOMEM_CLI -o $@.elf turbomem.c $(TESTLD) \
 	    -Wl,-Map=$@.map
 	elf2hunk $@.elf $@
 	$(OBJDUMP) -D $@.elf > $@.s
@@ -129,7 +149,7 @@ STAGE ?= 1
 
 hello: | $(TESTDIR)
 	$(CC) $(CFLAGS) -DSTAGE=$(STAGE) -o $(TESTDIR)/Hello$(STAGE).elf \
-	    hello.c $(LDFLAGS) -Wl,-Map=$(TESTDIR)/Hello$(STAGE).map
+	    hello.c $(TESTLD) -Wl,-Map=$(TESTDIR)/Hello$(STAGE).map
 	elf2hunk $(TESTDIR)/Hello$(STAGE).elf $(TESTDIR)/Hello$(STAGE)
 	$(OBJDUMP) -D $(TESTDIR)/Hello$(STAGE).elf > $(TESTDIR)/Hello$(STAGE).s
 	@$(MAKE) --no-print-directory check-entry \
@@ -145,7 +165,7 @@ $(ROMDIR):
 	@mkdir -p $@
 
 $(ROMDIR)/turbomem.elf: turbomem.c turbomem.ld | $(ROMDIR)
-	$(CC) $(CFLAGS) $(ROMFLAGS) -o $@ turbomem.c $(LDFLAGS) \
+	$(CC) $(CFLAGS) $(ROMFLAGS) $(DIAGFLAGS) -o $@ turbomem.c $(ROMLD) \
 	    -Wl,-Map=$(ROMDIR)/turbomem.map
 	$(OBJDUMP) -D $@ > $(ROMDIR)/turbomem.s
 
