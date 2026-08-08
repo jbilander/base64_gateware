@@ -46,7 +46,16 @@ SECTIONS
     /* Image size, for the DiagArea's da_Size. Works because the script
      * starts at 0, so the end address IS the length. .data and .bss are
      * empty by construction -- check-pic enforces that -- so this lands
-     * immediately after .rodata. */
+     * immediately after .rodata.
+     *
+     * ROUNDED UP TO A WHOLE WORD, deliberately. expansion.library copies a
+     * DAC_WORDWIDE diag area wordwise, and an odd da_Size invites a
+     * (size >> 1) loop to drop the final byte. The final byte of this
+     * image is the NUL terminating the name string exec keeps a pointer
+     * to for the life of the machine. One byte of padding costs nothing
+     * and removes the question -- and the Makefile already pads the .bin
+     * to the same boundary for $readmemh, so the two now agree. */
+    . = ALIGN(2);
     __rom_end = .;
 
     /DISCARD/ : { *(.comment) *(.note*) }

@@ -231,30 +231,98 @@ ULONG turbomem_add(struct ExecBase *sysbase)
 /* Set 1 for bring-up: DiagPoint returns without touching anything, which
  * proves the FPGA ROM window and the autoconfig entry in isolation. Set 0
  * once the board enumerates and DiagPoint is demonstrably reached. */
+/* DIAG_TRACE -- bring-up only, off by default.
+ *
+ * DiagPoint runs long before dos.library exists, so there is nowhere to
+ * print. The background colour is the only channel available this early,
+ * and it is the classic one. Each colour is held by a busy loop because
+ * the OS overwrites COLOR00 as soon as the boot screen appears, and a
+ * single-frame flash is not something you can reliably catch.
+ *
+ * The point is to separate failures that look identical from the outside:
+ *
+ *   no colour at all  DiagPoint was never called. The problem is the copy
+ *                     gate, the ROM window, or autoconfig -- not this code.
+ *   red then green    called, probed, AddMemList done. Working.
+ *   red then blue     called, but exec is older than V33.
+ *   red then white    called, but a probe read back wrong. The window at
+ *                     $08000000 is the suspect, not the ROM path.
+ *
+ * One build answers "was it called" and "did it work", instead of two.
+ */
+#ifndef DIAG_TRACE
+#define DIAG_TRACE 0
+#endif
+
+/* How long each colour is held. This has to be long enough to catch by eye
+ * on a machine you are not filming: DiagPoint runs during expansion
+ * configuration, so the colours appear in the second or two before the boot
+ * screen, and if you are not already staring at the monitor you will miss a
+ * flash. Roughly 3 seconds per colour at 7 MHz, less on a turbo. Bring-up
+ * only -- it delays every boot by twice this. */
+#ifndef DIAG_TRACE_LOOPS
+#define DIAG_TRACE_LOOPS 1500000UL
+#endif
+
 #ifndef DIAG_STUB
 #define DIAG_STUB 0
 #endif
 
-/* The header MUST be at offset 0 -- er_InitDiagVec points at it. It goes
+/* The header MUST be at offset 0 -- the autoconfig ROM vector points at
+ * it. It goes
  * in .text.entry, which turbomem.ld places ahead of everything else; the
  * same mechanism that puts _start first in the CLI build.
  *
- * FIELD NOTES, from libraries/configregs.h:
+ * FIELD NOTES
  *
- *   er_InitDiagVec is a WORD offset from the board base, so a vector of
- *   $0001 means byte 2. Set the autoconfig nibbles accordingly.
+ *   da_Config MUST HAVE A BOOT-TIME BIT SET OR NOTHING HAPPENS. This was
+ *   a real bug in the first version: DAC_WORDWIDE on its own leaves the
+ *   boot-time field at DAC_NEVER, and expansion.library tests that field
+ *   BEFORE it will copy anything. No copy means no DiagPoint call, ever.
+ *   The board still enumerates and still appears in ShowConfig, so the
+ *   failure is invisible until you check whether DiagPoint actually ran.
+ *   DAC_CONFIGTIME it is.
  *
- *   da_Size and both code offsets are relative to the image AFTER it has
- *   been copied to RAM and de-nibbleized -- "the size of the actual
- *   information, not how much address space is required to store it".
- *   With DAC_WORDWIDE those are the same thing, which is one more reason
- *   to use it.
+ *   da_BootPoint MUST BE NON-ZERO for the same reason. RKM Libraries,
+ *   "Events At DIAG Time": "Note that the da_BootPoint offset must be
+ *   non-NULL, or else no copy will occur." Hence diag_boot below.
+ *
+ *   diag_boot is never reached in practice. BootPoint is only called
+ *   through a BootNode on eb_MountList, and nothing here creates one, so
+ *   the stub exists purely to satisfy that test. It returns 0 rather than
+ *   falling through into whatever the linker puts after it.
+ *
+ *   er_InitDiagVec is a BYTE offset from the board base. The note that
+ *   used to be here said word offset, on the strength of a comment in
+ *   Commodore's own libraries/configregs.i. That comment is wrong, and
+ *   Commodore's own documentation contradicts it three ways:
+ *
+ *     - RKM Libraries worked example: er_InitDiagVec reads $0080 and the
+ *       DiagArea hex dump is shown at board offset $0080.
+ *     - The RKM sample source codes it as (DiagStart-RomStart), a plain
+ *       byte difference, and asserts the block ahead of it is exactly
+ *       $80 BYTES: "IFNE *-RomStart-$80 / FAIL".
+ *     - UAE's expansion.c writes $1000 and memcpy()s its DiagArea to
+ *       expamem + 0x1000. That bootrom works on Kickstart 1.3 upwards.
+ *
+ *   turbomem_zii.v sidesteps the argument by serving this image at board
+ *   offset 0 and advertising a vector of $0000, which resolves to the
+ *   same address under either reading. Nothing here depends on winning
+ *   it -- but the SD card entry will, so do not carry the word-offset
+ *   claim across to it.
+ *
+ *   da_Size is rounded up to a whole word by turbomem.ld. The copy is
+ *   wordwise, and an odd da_Size invites a (size >> 1) loop to drop the
+ *   final byte -- which in this image is the NUL terminating the name
+ *   string exec keeps a pointer to forever. One pad byte removes the
+ *   question. The configregs.h note about size being "the size of the
+ *   actual information, not how much address space is required to store
+ *   it" is about NIBBLEWIDE and BYTEWIDE ROMs, where the information is
+ *   spread over 4x or 2x the address space. It is not an argument
+ *   against word alignment.
  *
  *   DAC_BYTEWIDE carries "BUG: Will not work under V34 Kickstart!" in the
  *   header, and V34 is 1.3. DAC_WORDWIDE it is.
- *
- *   da_BootPoint is zero, so the boot-time field is DAC_NEVER (0x00) and
- *   da_Config is just DAC_WORDWIDE.
  *
  * __rom_end comes from the linker script and equals the image size,
  * because the script starts at 0. */
@@ -262,14 +330,23 @@ asm(
 "       .section .text.entry,\"ax\"\n"
 "       .globl  diag_area\n"
 "diag_area:\n"
-"       .byte   0x80\n"                     /* da_Config: DAC_WORDWIDE  */
+"       .byte   0x90\n"                     /* da_Config: DAC_WORDWIDE  */
+                                            /*          | DAC_CONFIGTIME*/
 "       .byte   0\n"                        /* da_Flags                 */
 "       .word   __rom_end\n"                /* da_Size                  */
 "       .word   diag_point - diag_area\n"   /* da_DiagPoint             */
-"       .word   0\n"                        /* da_BootPoint: none       */
-"       .word   diag_name - diag_area\n"    /* da_Name                  */
+"       .word   diag_boot  - diag_area\n"   /* da_BootPoint             */
+"       .word   diag_name  - diag_area\n"   /* da_Name                  */
 "       .word   0\n"                        /* da_Reserved01            */
 "       .word   0\n"                        /* da_Reserved02            */
+/* Raw opcodes rather than mnemonics. This is a top-level basic asm(), so
+ * GCC passes the text through untouched, and spelling the two
+ * instructions as data keeps the block free of any question about whether
+ * this assembler wants "moveq #0,d0" or "moveq #0,%d0". Four bytes. */
+"diag_boot:\n"
+"       .word   0x7000\n"                   /* moveq #0,d0              */
+"       .word   0x4e75\n"                   /* rts                      */
+"       .even\n"
 "       .text\n"
 "diag_name:\n"
 "       .asciz  \"turbo memory\"\n"
@@ -289,12 +366,34 @@ asm(
  * uses -ffixed-a6, so binding a parameter to it is asking for trouble,
  * and address 4 is authoritative anyway.
  *
- * RETURN VALUE IS NOT A SUCCESS FLAG. Per the header, returning NULL
- * tells expansion.library to hand the copied area back to the free memory
- * pool. Nothing here needs to persist after the call, so zero would be
- * correct and tidier -- but during bring-up return non-zero, so a freed
- * copy cannot muddy the picture if something else goes wrong. */
+ * RETURN VALUE IS NOT A SUCCESS FLAG, AND IT MUST NEVER BE ZERO. Per the
+ * header, returning NULL tells expansion.library to hand the copied area
+ * back to the free memory pool.
+ *
+ * The note that used to be here reasoned that nothing needed to persist
+ * after the call, so zero would be tidier. That is wrong, and the reason
+ * is two screens up in this same file: AddMemList STORES the name
+ * pointer, it does not copy the string. In the ROM build that pointer is
+ * -mpcrel relative, so it points into THIS COPY. Return zero and exec's
+ * memory list is left with ln_Name dangling into reclaimed memory, which
+ * every tool that prints the list -- Avail, AmigaTestKit, dump_memlist
+ * below -- will then walk.
+ *
+ * So: non-zero, permanently. Not just during bring-up. The copy is ~200
+ * bytes and exec owns it for the life of the machine, exactly as it owns
+ * the AllocMem'd copy the CLI build makes. */
 ULONG diag_point(void);
+
+#if DIAG_TRACE && !DIAG_STUB
+static void diag_flash(UWORD colour)
+{
+    volatile UWORD *color00 = (volatile UWORD *)0xDFF180UL;
+    volatile ULONG  i;
+
+    *color00 = colour;
+    for (i = 0; i < DIAG_TRACE_LOOPS; i++) { }
+}
+#endif
 
 ULONG diag_point(void)
 {
@@ -305,9 +404,21 @@ ULONG diag_point(void)
 
     asm volatile ("move.l 4.w,%0" : "=r"(sysbase));
 
+#if DIAG_TRACE
+    {
+        ULONG rc;
+
+        diag_flash(0x0F00);                 /* red   -- we got called      */
+        rc = turbomem_add(sysbase);
+        diag_flash(rc == 0                   ? 0x00F0   /* green -- added   */
+                 : rc == TURBOMEM_BAD_VERSION ? 0x000F   /* blue  -- old exec*/
+                                              : 0x0FFF); /* white -- probe   */
+    }
+#else
     /* Ignore the result. There is nowhere to report a failed probe from
      * here, and adding nothing is the correct outcome either way. */
     (void)turbomem_add(sysbase);
+#endif
 
     return 1;
 #endif

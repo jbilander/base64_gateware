@@ -39,8 +39,9 @@
 //
 // Pairs with base64_6x.fdc. Toolchain: Diamond / Synplify Pro.
 // fx68k ports match UPSTREAM ijor/fx68k (no E_rise/E_fall, eab[23:1]).
-// SDRAM / SD / autoconfig are stripped for bring-up; their PORTS are kept so
-// base64.lpf needs no edits, and hooks are marked "REATTACH" below.
+// SDRAM and its autoconfig are live. The SD card device is still stripped
+// (see section 10c); its PORTS are kept so base64.lpf needs no edits, and the
+// hooks are marked "REATTACH" below.
 // ============================================================================
 `default_nettype none
 
@@ -403,10 +404,13 @@ module base64_top #(
     // REATTACH: internal slaves (autoconfig / SD / fastmem) mux in here.
     wire [15:0] core_iedb  =
           fm_ac_oe ? {fm_ac_dout, 12'hFFF}
+        : tm_ac_oe ? {tm_ac_dout, 12'hFFF}
         : fm_space ? fm_dout
+        : tm_space ? tm_dout
         : RETIME   ? (rt_av ? {8'h00, av_num} : rt_rd)
                    : (av_valid ? {8'h00, av_num} : rd_data);
-    wire        int_dtack_lo  = ~fm_dtack_n | ~fm_ac_dtack_n;
+    wire        int_dtack_lo  = ~fm_dtack_n | ~fm_ac_dtack_n
+                              | ~tm_dtack_n | ~tm_ac_dtack_n;
     wire        core_dtack_n = ~((RETIME ? rt_dtack_lo : core_dtack_lo)
                                  | int_dtack_lo);
     wire        core_berr_n  = ~core_berr_lo;
@@ -774,8 +778,8 @@ module base64_top #(
     always @(posedge clk) bus_enable <= pwrup_done & bus_owned;
     // Open the switchable CBTs on our own cycles so the CPU<->SDRAM traffic
     // is isolated from the motherboard bus.
-    assign cbt_oe_d0_7_n   = ~bus_enable | fm_active;
-    assign cbt_oe_d8_15_n  = ~bus_enable | fm_active;
+    assign cbt_oe_d0_7_n   = ~bus_enable | fm_active | tm_active;
+    assign cbt_oe_d8_15_n  = ~bus_enable | fm_active | tm_active;
     assign cbt_oe_ctl_hi_n = ~bus_enable;
     assign cbt_oe_a8_17_n  = ~bus_enable;
     assign cbt_oe_a1_7_n   = ~bus_enable;
@@ -902,12 +906,30 @@ module base64_top #(
     // it. With no sd_subsystem behind it that hangs at the boot menu. Bring it
     // back in the same commit as the SD controller, not before.
     //
-    // fastmem_zii carries its OWN autoconfig (fm_ac_*), so fast RAM needs only
-    // these two modules and the chain is cfgin -> fastmem -> cfgout.
+    // fastmem_zii carries its OWN autoconfig (fm_ac_*). That is deliberate and
+    // stays: it is welded to the OFFER_SPLIT size negotiation, and its state
+    // order encodes the Kickstart config-overflow workaround where 2M must be
+    // offered before 4M.
+    //
+    // turbomem_zii is therefore a THIRD board on the daisy chain, not a
+    // refactor of either of the others:
+    //
+    //     cfgin(pin) -> fastmem_zii -> turbomem_zii -> cfgout(pin)
+    //
+    // It serves the turbomem DiagArea so expansion.library copies it into RAM
+    // and calls DiagPoint -- which is where turbomem_add() hands the
+    // $08000000 window to exec via AddMemList().
     wire        fm_space, fm_active, fm_dtack_n;
     wire [15:0] fm_dout;
     wire        fm_ac_access, fm_ac_oe, fm_ac_dtack_n;
     wire [3:0]  fm_ac_dout;
+    wire        tm_space, tm_active, tm_dtack_n;
+    wire [15:0] tm_dout;
+    wire        tm_ac_access, tm_ac_oe, tm_ac_dtack_n;
+    wire [3:0]  tm_ac_dout;
+    wire [7:0]  tm_base;
+    wire        tm_configured;
+    wire        ac_chain_n;      // fastmem CFGOUT -> turbomem CFGIN
     wire        sd_req, sd_we, sd_ack, sd_ready, sd_wr_valid, sd_ack_early;
     wire [15:0] sd_rdata_live;
     wire [23:0] sd_saddr;
@@ -930,7 +952,7 @@ module base64_top #(
         .fm_dout    (fm_dout),
         .fm_dtack_n (fm_dtack_n),
         .fm_active  (fm_active),
-        .cfgout_n   (cfgout_n),
+        .cfgout_n   (ac_chain_n),
         .fm_ac_access (fm_ac_access),
         .fm_ac_dout   (fm_ac_dout),
         .fm_ac_oe     (fm_ac_oe),
@@ -946,6 +968,66 @@ module base64_top #(
         .rdata_live (sd_rdata_live),
         .rdata      (sd_rdata),
         .sdram_ready(sd_ready)
+    );
+
+    // ROM_FILE: turbomem.mem MUST BE A MEMBER OF THE DIAMOND PROJECT.
+    //
+    // Putting it in the directory Synplify runs from is NOT enough. Measured
+    // on this design: microrom.mem, nanorom.mem, sfsd.mem and turbomem.mem
+    // all sat in prj/base64_fx68k/impl1/, and $readmemh found the project
+    // members and not the fourth file. Add it via File > Add > Existing File
+    // so it appears in the Input Files list.
+    //
+    // If it is ever not found, the failure is silent and convincing:
+    //
+    //   log: CG371 Cannot find data file turbomem.mem for task $readmemh
+    //   log: CL279 Pruning register bits 15 to 1 of rom_q[15:0]
+    //
+    // and the array constant-folds to zero. The board then enumerates
+    // perfectly at its assigned base while serving 8 KB of zeroes, an
+    // all-zero DiagArea reads as DAC_NIBBLEWIDE/DAC_NEVER with a null
+    // BootPoint so expansion.library declines to touch it, and the machine
+    // boots normally. Every symptom points at the gateware decode. None of
+    // them are the gateware decode.
+    //
+    // The check that cannot lie is the block RAM count: ROM_AWID 12 is
+    // 4096x16, which is four EBRs. If "Number of block RAMs" did not rise by
+    // four, the ROM is not in the bitstream.
+    //
+    // An absolute path here also works and cannot fail, if the project route
+    // ever gives trouble.
+    turbomem_zii #(
+        .MFG_ID   (16'h144A),
+        .PROD_ID  (8'd13),        // 11 = SD card, 12 = fast RAM, 13 = this
+        .SERIAL   (32'd0),
+        .DIAG_VEC (16'h2000),     // BYTE offset, MUST be non-zero: a zero
+                                  // vector enumerates fine and is never
+                                  // followed. $2000 needs no decode change
+                                  // (the image mirrors every 8 KB) and is
+                                  // still safe if read as a word offset.
+        .ROM_AWID (12),           // 4096 words = 8 KB = 4 EBRs
+        .ROM_FILE ("turbomem.mem")
+    ) u_turbomem (
+        .clk        (clk),
+        .reset      (slave_reset),
+        .cfgin_n    (ac_chain_n),
+        .as_n       (core_as_n),
+        .uds_n      (core_uds_n),
+        .lds_n      (core_lds_n),
+        .rw         (core_rw),
+        .a          (core_a),
+        .d_in       (core_dout),
+        .tm_space   (tm_space),
+        .tm_dout    (tm_dout),
+        .tm_dtack_n (tm_dtack_n),
+        .tm_active  (tm_active),
+        .tm_ac_access (tm_ac_access),
+        .tm_ac_dout   (tm_ac_dout),
+        .tm_ac_oe     (tm_ac_oe),
+        .tm_ac_dtack_n(tm_ac_dtack_n),
+        .cfgout_n     (cfgout_n),
+        .tm_base      (tm_base),
+        .tm_configured(tm_configured)
     );
 
     wire sdram_clk_int;
@@ -969,8 +1051,10 @@ module base64_top #(
     ODDRX1F u_sdram_clk (.D0(1'b0), .D1(1'b1), .SCLK(clk),
                          .RST(1'b0), .Q(sdram_clk));
 
-    // A cycle that never reaches the motherboard.
-    wire int_space = fm_space | fm_ac_access;
+    // A cycle that never reaches the motherboard. A missing term here is
+    // silent and nasty: the retime FSM would drive AS out to the motherboard
+    // for a cycle we are already answering on-chip.
+    wire int_space = fm_space | fm_ac_access | tm_space | tm_ac_access;
 
     // ========================================================================
     // 11b. Reveal debug bundle

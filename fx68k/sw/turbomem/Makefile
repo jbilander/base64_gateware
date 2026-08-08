@@ -83,7 +83,17 @@ ROMFLAGS  = -mpcrel
 # Use it to prove the FPGA ROM window and the autoconfig entry on their
 # own, before the payload is in the picture.
 DIAG_STUB ?= 0
-DIAGFLAGS  = -DDIAG_STUB=$(DIAG_STUB)
+
+# make rom DIAG_TRACE=1 -> DiagPoint signals through COLOR00 before and after
+# turbomem_add, so one boot tells you whether it was called AND whether the
+# probe passed. Bring-up only; leave at 0 for a real build.
+#   no colour   never called -- suspect the copy gate or the ROM window
+#   red->green  called, probed, added
+#   red->blue   called, exec older than V33
+#   red->white  called, probe read back wrong -- suspect $08000000
+DIAG_TRACE ?= 0
+
+DIAGFLAGS  = -DDIAG_STUB=$(DIAG_STUB) -DDIAG_TRACE=$(DIAG_TRACE)
 # --emit-relocs IS REQUIRED FOR THE HUNK BUILD.
 #
 # DOS loads a hunk executable wherever it likes and fixes up absolute
@@ -116,7 +126,7 @@ LDFLAGS   = -nostdlib -nostartfiles -T turbomem.ld
 TESTLD    = $(LDFLAGS) -Wl,--emit-relocs
 ROMLD     = $(LDFLAGS)
 
-.PHONY: all test rom hello check-lvo check-pic check-a6 check-entry check-relocs install-mem clean
+.PHONY: all test rom hello cfgdump check-lvo check-pic check-a6 check-entry check-relocs check-diag install-mem clean
 all: test
 
 # ---------------------------------------------------------------------
@@ -156,10 +166,23 @@ hello: | $(TESTDIR)
 	    ENTRY_ELF=$(TESTDIR)/Hello$(STAGE).elf
 	@echo "--> $(TESTDIR)/Hello$(STAGE)"
 
+# Prints what expansion.library actually recorded for every board, and reads
+# the DiagArea back through the board window. Answers "did exec see
+# DIAGVALID", "what vector did it read back" and "is the ROM really there"
+# without an FPGA rebuild, which is the expensive part of every other check.
+cfgdump: | $(TESTDIR)
+	$(CC) $(CFLAGS) -o $(TESTDIR)/CfgDump.elf \
+	    cfgdump.c $(TESTLD) -Wl,-Map=$(TESTDIR)/CfgDump.map
+	elf2hunk $(TESTDIR)/CfgDump.elf $(TESTDIR)/CfgDump
+	$(OBJDUMP) -D $(TESTDIR)/CfgDump.elf > $(TESTDIR)/CfgDump.s
+	@$(MAKE) --no-print-directory check-entry \
+	    ENTRY_ELF=$(TESTDIR)/CfgDump.elf
+	@echo "--> $(TESTDIR)/CfgDump"
+
 # ---------------------------------------------------------------------
 # ROM image
 # ---------------------------------------------------------------------
-rom: $(ROMDIR)/turbomem.mem check-pic
+rom: $(ROMDIR)/turbomem.mem check-pic check-diag
 
 $(ROMDIR):
 	@mkdir -p $@
@@ -200,9 +223,32 @@ $(ROMDIR)/turbomem.mem: $(ROMDIR)/turbomem.bin
 	 fi
 	@echo "--> $@  $$(wc -l < $@) words, all 4 digits"
 
-install-mem: $(ROMDIR)/turbomem.mem
+# The .mem has to land in TWO places and forgetting the second one is silent.
+# RTLDIR is the committed copy, so a gateware-only contributor gets a working
+# image from a fresh clone. IMPLDIR is where Synplify actually reads it from:
+# $$readmemh resolves against the directory synthesis runs in, which for
+# Diamond is the implementation directory, NOT the RTL tree. Copying only to
+# RTLDIR builds a bitstream containing whatever stale image was left in
+# impl1/ -- and a stale ROM behaves exactly like a broken one.
+#
+# Diamond's "Clean" deletes .mem files from impl1/, so this target has to be
+# re-run after one. So do microrom.mem, nanorom.mem and sfsd.mem.
+IMPLDIR ?= ../../../prj/base64_fx68k/impl1
+
+# check-diag first: this is the last gate before the image reaches the RTL
+# tree, and once it is committed there a gateware-only contributor has no
+# way to tell a good image from a bad one.
+install-mem: $(ROMDIR)/turbomem.mem check-diag
 	cp $< $(RTLDIR)/turbomem.mem
 	@echo "--> installed into $(RTLDIR)/"
+	@if [ -d "$(IMPLDIR)" ]; then \
+		cp $< $(IMPLDIR)/turbomem.mem; \
+		echo "--> installed into $(IMPLDIR)/ (the one Synplify reads)"; \
+	else \
+		echo "!!! $(IMPLDIR) not found -- Synplify will use a STALE image."; \
+		echo "!!! set IMPLDIR=<your Diamond impl dir> and re-run."; \
+		exit 1; \
+	fi
 
 # ---------------------------------------------------------------------
 # Checks
@@ -218,6 +264,18 @@ check-pic: $(ROMDIR)/turbomem.elf
 	@echo "    not be referenced absolutely - see the check above) ==="
 	@$(OBJDUMP) -h $< | grep -E "\.data|\.bss|\.text|\.rodata"
 
+# Validate the DiagArea header before the image can reach hardware.
+#
+# THE FAILURE THIS EXISTS TO CATCH IS SILENT. A DiagArea whose da_Config has
+# no boot-time bit, or whose da_BootPoint is zero, is never copied to RAM by
+# expansion.library -- so DiagPoint is never called. The board still
+# enumerates, still answers its window, and still appears in ShowConfig.
+# Stage 1 of the bring-up plan passes and tells you nothing at all.
+#
+# Both of those were true of the first ROM image built from this directory.
+check-diag: $(ROMDIR)/turbomem.mem
+	@sh ./check_diag.sh $<
+
 # Verify the AddMemList LVO before trusting it. A wrong offset jumps into
 # a neighbouring exec function with our arguments already in registers.
 check-lvo:
@@ -225,8 +283,8 @@ check-lvo:
 	@grep -rn -A4 "AddMemList" $(NDK)/sys-include/inline/exec.h || true
 	@echo "=== assembler LVO equates ==="
 	@grep -rn "_LVOAddMemList" $(NDK) || true
-	@echo "=== DiagArea layout and DAC_ flags, for the next stage ==="
-	@grep -rn "da_DiagPoint\|DAC_WORDWIDE\|struct DiagArea" $(NDK)/sys-include/ || true
+	@echo "=== DiagArea layout and DAC_ flags ==="
+	@grep -rn "da_DiagPoint\|DAC_WORDWIDE\|DAC_CONFIGTIME\|DAC_NEVER\|struct DiagArea" $(NDK)/sys-include/ || true
 	@echo "=== DiagPoint calling convention (autodocs, if shipped) ==="
 	@grep -rln "DiagPoint" $(NDK) --include="*.doc" --include="*.guide" || true
 
