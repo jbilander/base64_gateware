@@ -28,7 +28,10 @@
 //
 module fastmem_zii #(
     parameter [15:0] MFG_ID   = 16'h144A,   // reuse OAHR id; product distinct
-    parameter [7:0]  PROD_ID  = 8'd12,      // 5194/12 = Base64 fast RAM
+    parameter [7:0]  PROD_ID  = 8'd13,      // 5194/13 = Base64 fast RAM.
+                                            // base64_top.sv overrides this;
+                                            // its allocation block is the
+                                            // authority for all three IDs.
     parameter [31:0] SERIAL   = 32'd0,
     parameter        OFFER_SPLIT = 1'b1     // 1: after 2M, also offer 4M (6M total)
 )(

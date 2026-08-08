@@ -938,7 +938,29 @@ module base64_top #(
 
     wire slave_reset = ext_reset;
 
-    fastmem_zii #(.OFFER_SPLIT(1'b1)) u_fastmem (
+    // -----------------------------------------------------------------
+    // AUTOCONFIG ID ALLOCATION -- manufacturer 5194 ($144A), OAHR
+    //
+    // This block is the authority for all three IDs. Both modules carry
+    // their own PROD_ID defaults, but what the board actually presents is
+    // what is overridden here, so change them HERE.
+    //
+    //   5194/11  SD card         reused from the SF2000 on purpose, so the
+    //                            unmodified sfsd.device binds without a
+    //                            driver fork. Registered to Niklas Ekstrom
+    //                            and Matt Harlum. Not instantiated yet --
+    //                            see the note in section 10c.
+    //   5194/13  Fast RAM        Zorro II, up to 8 MB
+    //   5194/14  AutoConfig ROM  64 KB Zorro II I/O board carrying the
+    //                            DiagArea that AddMemList()s the 16 MB at
+    //                            $08000000
+    //
+    // 13 and 14 are REQUESTED, NOT YET ASSIGNED. OAHR allocates product IDs
+    // and does not reserve them in advance, so these can still change until
+    // the application comes back. er_SerialNumber is 0 on every board, which
+    // is what the application declares.
+    // -----------------------------------------------------------------
+    fastmem_zii #(.PROD_ID(8'd13), .OFFER_SPLIT(1'b1)) u_fastmem (
         .clk        (clk),
         .reset      (slave_reset),
         .cfgin_n    (s_cfgin_n[1]),
@@ -998,7 +1020,7 @@ module base64_top #(
     // ever gives trouble.
     turbomem_zii #(
         .MFG_ID   (16'h144A),
-        .PROD_ID  (8'd13),        // 11 = SD card, 12 = fast RAM, 13 = this
+        .PROD_ID  (8'd14),        // see the ID allocation block above
         .SERIAL   (32'd0),
         .DIAG_VEC (16'h2000),     // BYTE offset, MUST be non-zero: a zero
                                   // vector enumerates fine and is never

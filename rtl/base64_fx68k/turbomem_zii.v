@@ -72,8 +72,10 @@ module turbomem_zii #(
     parameter        ROM_FILE  = "turbomem.mem",
 
     parameter [15:0] MFG_ID    = 16'h144A, // 5194 - OAHR, same as the others
-    parameter [7:0]  PROD_ID   = 8'd13,    // 5194/13 - turbomem diag ROM
-                                           //   (11 = SD card, 12 = fast RAM)
+    parameter [7:0]  PROD_ID   = 8'd14,    // 5194/14 = Base64 AutoConfig ROM.
+                                           // base64_top.sv overrides this; its
+                                           // allocation block is the authority
+                                           // for all three IDs.
     parameter [31:0] SERIAL    = 32'd0,
 
     // er_Type low nybble: {chained, size[2:0]}. 0001 = 64 KB, not chained.

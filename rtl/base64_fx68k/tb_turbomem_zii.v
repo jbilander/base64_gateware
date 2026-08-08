@@ -40,7 +40,7 @@ always #(CLK_NS/2.0) clk = ~clk;
 
 turbomem_zii #(
     .MFG_ID   (16'h144A),
-    .PROD_ID  (8'd13),
+    .PROD_ID  (8'd14),
     .SERIAL   (32'd0),
     .DIAG_VEC (16'h2000),
     .ROM_AWID (12),
@@ -70,7 +70,9 @@ wire [7:0]  tm2_base;
 
 turbomem_zii #(
     .MFG_ID   (16'h144A),
-    .PROD_ID  (8'd14),
+    .PROD_ID  (8'd15),   // bench-only stand-in, NOT an allocation --
+                         // must differ from dut1 so test [12] proves the
+                         // chain handed over instead of board 1 replying
     .DIAG_VEC (16'h2000),
     .ROM_AWID (12),
     .ROM_FILE ("turbomem.mem")
@@ -236,7 +238,7 @@ initial begin
     check("er_Type size field (001 = 64K)", {29'd0, b0[2:0]}, 32'd1);
 
     ac_byte(8'h04, 1'b1, b1);
-    check("er_Product", {24'd0, b1}, 32'd13);
+    check("er_Product", {24'd0, b1}, 32'd14);
 
     ac_byte(8'h08, 1'b1, b2);
     check("er_Flags", {24'd0, b2}, 32'h000000C0);
@@ -255,10 +257,6 @@ initial begin
     ac_byte(8'h2C, 1'b1, b1);
     dvec = {b0, b1};
     check("er_InitDiagVec", {16'd0, dvec}, 32'h00002000);
-    if (dvec == 16'h0000) begin
-        $display("  FAIL  er_InitDiagVec is zero - expansion.library tests this vector and a zero one is never followed");
-        errors = errors + 1;
-    end
 
     // ---- 4. Assign the base, $4A first then $48 ---------------------------
     $display("\n[4] Base assignment to $E90000");
@@ -351,7 +349,7 @@ initial begin
     check("board 1 CFGOUT low", {31'd0, cfgout_n},  32'd0);
     check("board 2 CFGOUT high", {31'd0, cfgout2_n}, 32'd1);
     ac_byte(8'h04, 1'b1, b1);
-    check("er_Product now board 2's", {24'd0, b1}, 32'd14);
+    check("er_Product now board 2's", {24'd0, b1}, 32'd15);
 
     // ---- 13. Shut-up path -------------------------------------------------
     // A board told to shut up must go silent and pass the chain on. If it
