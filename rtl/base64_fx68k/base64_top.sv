@@ -55,7 +55,20 @@ module base64_top #(
     // ---- 7M grid alignment ----------------------------------------------
     // Larger PHASE_OFS moves our S-state grid EARLIER relative to the real
     // 7M edge, in 11.75 ns steps. Calibrate once (see notes), then leave it.
-    parameter integer PWRUP_BIT  = 23,   // sim override only
+    // PWRUP_BIT sets both the power-up hold AND the cold-boot reset pulse.
+    //   23 = ~98 ms   24 = ~197 ms   25 = ~394 ms   26 = ~788 ms
+    // Raised to 25 while chasing the cold-boot double bus fault: the core was
+    // being started before something on the motherboard could answer, and a
+    // reset applied later by hand (Ctrl-A-A) always works. Sweep it downwards
+    // once the real cause is known -- every step doubles the time from power
+    // on to a usable machine.
+    parameter integer PWRUP_BIT  = 25,   // sim override only
+    parameter         COLD_RESET = 1'b1, // FPGA drives /RESET+/HALT at
+                                         // power-up; see section 1b
+    parameter         COLD_RETRY = 1'b1, // reset again if the core double
+                                         // bus faults; see section 7b
+    parameter         PASSIVE_EN = 1'b1, // hand the bus over to another
+                                         // accelerator holding /BR; see 9b
     parameter [4:0]   PHASE_OFS  = 5'd2,
 
     // Master clocks between the nominal S4 falling edge and the instant we
@@ -208,15 +221,82 @@ module base64_top #(
     // ~98 ms after configuration before the core's first fetch: rails,
     // ICS570B lock and the Amiga's own POR are all settled. Runs once per
     // FPGA configuration; warm resets are unaffected.
-    // NOTE (cold boot): see DESIGN_NOTES — the robust fix is to make the FPGA
-    // the reset SOURCE at the end of this hold rather than relying on the
-    // board is expected to come up on a warm reset (Ctrl-A-A) during bring-up.
-    // PWRUP_BIT is a parameter purely so simulation can shorten the ~98 ms
-    // hold. Do not lower it in a real build.
-    reg  [23:0] pwrup_cnt = 24'd0;
-    wire        pwrup_done = pwrup_cnt[PWRUP_BIT];
+    // PWRUP_BIT is a parameter so simulation can shorten the hold, and so the
+    // cold-boot pulse length can be swept. It also sets the pulse length.
+    //
+    // THE COUNTER IS SIZED FROM THE PARAMETER, deliberately. It used to be a
+    // fixed reg [23:0], and raising PWRUP_BIT to 25 selected a bit that does
+    // not exist. Verilog returns constant 0 for an out-of-range bit select,
+    // so pwrup_done never asserted, ext_reset was stuck asserted, fx68k
+    // constant-folded away, and the FPGA held /RESET and /HALT low forever --
+    // a 29-SLICE bitstream and a machine that could not even be rescued by
+    // Ctrl-A-A. Synplify says so plainly and it is easy to miss:
+    //
+    //   WARNING - CS101 : Index 25 is out of range for variable pwrup_cnt
+    //
+    // Treat CS101 as fatal in any build check, alongside CG371 and BN105.
+    reg  [PWRUP_BIT:0] pwrup_cnt = 0;
+    wire               pwrup_done = pwrup_cnt[PWRUP_BIT];
     always @(posedge clk)
-        if (!pwrup_done) pwrup_cnt <= pwrup_cnt + 24'd1;
+        if (!pwrup_done) pwrup_cnt <= pwrup_cnt + 1'b1;
+
+    // ========================================================================
+    // 1b. Cold-boot reset pulse — the FPGA is the reset SOURCE
+    // ========================================================================
+    // THE PROBLEM. On a cold start the Amiga's power-on reset finishes while
+    // the ECP5 is still loading its bitstream from SPI flash. The motherboard
+    // then sits for a few hundred milliseconds with no CPU at all, and when
+    // fx68k finally comes out of the power-up hold it is stepping into a
+    // machine whose CIAs and custom chips were reset long ago and were never
+    // released in step with a CPU. Warm reset (Ctrl-A-A) works precisely
+    // because everything is reset TOGETHER.
+    //
+    // THE FIX. Drive /RESET and /HALT low for the whole power-up hold, then
+    // release. The machine is then reset by us, with the CPU present, which
+    // is the same condition a warm reset produces. Costs no extra state: the
+    // hold already exists and pwrup_done latches high for good, so this runs
+    // exactly once per FPGA configuration and a later Ctrl-A-A or RESET
+    // instruction cannot re-trigger it.
+    //
+    // BOTH lines are required. The 68000 takes an external reset only when
+    // /RESET and /HALT are asserted together — /RESET alone is what a RESET
+    // instruction does, and would reset the peripherals but not us. This is
+    // the one place we legitimately drive /HALT, and it is a machine reset,
+    // not a consequence of a halt, so it does not violate the independence
+    // rule stated in section 7.
+    //
+    // The release is self-timed and needs no ordering logic. ext_reset is
+    // built from the SYNCHRONISED pins, so when we stop driving, fx68k stays
+    // in reset until the real bus lines have actually risen through the
+    // motherboard's pull-ups. The core cannot start before the machine does.
+    //
+    // The CBT question is settled: base64.lpf line 163 records /RESET and
+    // /HALT on U5, whose OE is hardwired to GND. The pulse reaches the bus.
+    //
+    // Set COLD_RESET = 1'b0 to bisect this back out in one line.
+    wire cold_rst = COLD_RESET & ~pwrup_done;
+
+    // ------------------------------------------------------------------
+    // ...and do not let the core start until the machine has ACTUALLY come
+    // out of reset.
+    //
+    // Releasing the pulse is not the same as the bus being released. The
+    // Amiga's own power-on reset can outlast our hold, and on this board
+    // /HALT is pulled up and driven by nothing except us -- so the moment we
+    // stop driving, /HALT goes high while /RESET may still be held low by
+    // the motherboard. ext_reset's normal term needs BOTH low, so it would
+    // deassert and the core would start into a machine that is still in
+    // reset: ROM fetches work, every custom chip and CIA does not.
+    //
+    // cold_armed holds the core until both lines have been observed high at
+    // least once after the hold. It is a ONE-SHOT and latches off for good,
+    // because after this a RESET instruction drives /RESET alone for ~17.5 us
+    // (rst_stretch) and must never be able to reset the core.
+    //
+    // No deadlock: if something else holds /RESET low forever the core waits,
+    // but so would a real 68000, and a Ctrl-A-A still clears it.
+    // ------------------------------------------------------------------
+    reg cold_armed = 1'b1;
 
     // ========================================================================
     // 2. Asynchronous input synchronisers (the ONLY real CDC in the design)
@@ -247,6 +327,9 @@ module base64_top #(
         s_ipl_a   <= cpu_ipl_n;
         s_ipl_b   <= s_ipl_a;
         s_7m_d    <= s_7m[1];
+
+        if (cold_armed && pwrup_done && s_reset_n[1] && s_halt_n[1])
+            cold_armed <= 1'b0;
     end
     wire edge_7m = s_7m[1] & ~s_7m_d;
 
@@ -284,6 +367,32 @@ module base64_top #(
                     slip_cnt <= slip_cnt + 2'd1;     // noise: ignore
                 end
             end
+        end
+
+        // DO NOT LOCK UNTIL THE CLOCK IS TRUSTWORTHY.
+        //
+        // This block used to lock on the first matching 7M edge after
+        // configuration -- within a couple of microseconds, long before the
+        // ICS570B is guaranteed settled. Lock to a bad phase and every
+        // motherboard cycle is sampled off the 7M grid: DTACK lands in the
+        // wrong place, the reset vector reads garbage, and the core takes an
+        // address error inside exception processing, which is a double bus
+        // fault. That is exactly the cold-boot failure.
+        //
+        // The evidence it really happens: ph_slip is sticky, and a cold boot
+        // was observed reaching a working desktop with red lit -- the core
+        // was not halted, so that red could only be ph_slip. The aligner had
+        // locked wrongly, then re-acquired once the clock settled.
+        //
+        // Keeping ph_locked clear through the hold means it re-acquires on
+        // every 7M edge and only latches once pwrup_done says the clock has
+        // been stable for PWRUP_BIT worth of time. Clearing ph_slip here too
+        // makes it mean what the LED claims: a slip AFTER the clock was
+        // trusted. Placed last so its assignments win over the block above.
+        if (!pwrup_done) begin
+            ph_locked <= 1'b0;
+            ph_slip   <= 1'b0;
+            slip_cnt  <= 2'd0;
         end
     end
 
@@ -369,12 +478,147 @@ module base64_top #(
     //     is far easier to debug than a box that silently reboots itself.
     //     The red LED reports it (section 12).
     // ------------------------------------------------------------------
-    wire ext_reset = (~s_reset_n[1] & ~s_halt_n[1]) | ~pwrup_done;
+    wire ext_reset = (~s_reset_n[1] & ~s_halt_n[1]) | ~pwrup_done | cold_armed;
 
     // Open-drain, and strictly independent: we never drive /HALT because of
     // a RESET instruction, and never drive /RESET because of a halt.
-    assign cpu_reset_n = (~core_oreset_n | rst_stretch) ? 1'b0 : 1'bz;
-    assign cpu_halt_n  = (~core_ohalted_n)              ? 1'b0 : 1'bz;
+    // ========================================================================
+    // 7b. Cold-boot retry
+    // ========================================================================
+    // WHAT WE KNOW FOR CERTAIN, and it is the only solid fact left: a reset
+    // applied by hand AFTER the core has halted always works. Cold boot never
+    // does. Elapsed time is NOT the variable -- the power-up hold was taken
+    // from ~98 ms to ~394 ms with no change whatsoever.
+    //
+    // So this reproduces the one thing that works. If the core double bus
+    // faults, wait, drive /RESET and /HALT low again, and let it try once
+    // more. Up to RETRY_MAX attempts, ~788 ms apart.
+    //
+    // This is a WORKAROUND, not a diagnosis, and it is also an experiment
+    // whose outcome is informative either way:
+    //
+    //   boots on attempt 1 or 2   the requirement is simply "another reset,
+    //                             later" -- and since 394 ms was not enough,
+    //                             the threshold is somewhere above that.
+    //   never boots, any number   our reset is NOT equivalent to a keyboard
+    //   of attempts               reset. That is a much bigger clue and it
+    //                             moves the search to what Ctrl-A-A does
+    //                             that driving the CPU socket does not.
+    //
+    // It disarms permanently once the core has run for ~1.6 s without
+    // halting, so a genuine double bus fault later in a session is left
+    // alone and still shows as a steady red LED, exactly as before. Watch
+    // the blue LED: each attempt is a visible blink.
+    //
+    // COLD_RETRY = 1'b0 removes it entirely.
+    // ========================================================================
+    // 788 ms was a guess made before there was any data -- "comfortably
+    // longer than any plausible settle". There is data now: the first attempt
+    // always fails and the second always succeeds, at 886 ms after the hold,
+    // which is exactly RTRY_WAIT + RTRY_PULSE. All that tells us is that the
+    // threshold lies somewhere in (394, 1280] ms. Far too coarse.
+    //
+    // Shortening the wait makes the retry a MEASURING INSTRUMENT: boot_ms
+    // then reports the threshold to within one attempt period instead of
+    // rounding it up to the next 886 ms. It also answers the question the
+    // coarse setting cannot:
+    //
+    //   boot_ms collapses to ~100 ms   the machine just needs resetting a
+    //                                  SECOND time. Not a wall-clock wait at
+    //                                  all, and cold boot gets ~1.2 s faster.
+    //   boot_ms stays near 886 ms      it really is a time requirement, and
+    //                                  now we know it to +/-104 ms.
+    //
+    // ~104 ms per attempt, 15 attempts, so it reaches ~1.95 s -- past the
+    // 1.28 s we know works, with margin.
+    localparam integer RTRY_WAIT  = 23;   // ~98 ms between attempts
+    localparam integer RTRY_PULSE = 19;   // ~6 ms of asserted reset; the CIAs
+                                          // and custom chips need microseconds
+    localparam [3:0]   RTRY_MAX   = 4'd15;
+
+    reg [27:0] rtry_cnt = 28'd0;
+    reg [3:0]  rtry_n   = 4'd0;
+    reg        rtry_rst = 1'b0;
+    reg        boot_ok  = 1'b0;
+
+    wire core_halted = ~core_ohalted_n;
+
+    always @(posedge clk) begin
+        if (!pwrup_done || !COLD_RETRY) begin
+            rtry_cnt <= 28'd0;
+            rtry_n   <= 4'd0;
+            rtry_rst <= 1'b0;
+            boot_ok  <= 1'b0;
+        end else if (!boot_ok) begin
+            rtry_cnt <= rtry_cnt + 28'd1;
+            if (rtry_rst) begin
+                if (rtry_cnt[RTRY_PULSE]) begin       // pulse done
+                    rtry_rst <= 1'b0;
+                    rtry_cnt <= 28'd0;
+                end
+            end else if (core_halted) begin
+                if (rtry_cnt[RTRY_WAIT] && rtry_n != RTRY_MAX) begin
+                    rtry_rst <= 1'b1;                 // try again
+                    rtry_n   <= rtry_n + 4'd1;
+                    rtry_cnt <= 28'd0;
+                end
+            end else begin
+                if (rtry_cnt[RTRY_WAIT + 1]) boot_ok <= 1'b1;   // it lives
+            end
+        end
+    end
+
+    // ========================================================================
+    // 7c. Boot statistics
+    // ========================================================================
+    // Counting LED blinks is a poor way to measure a boot, so the numbers are
+    // published where software can read them: four read-only words in the
+    // turbomem board's window at offset $F000. The ROM is 8 KB mirrored
+    // through a 64 KB window, so the top 4 KB is spare and expansion.library
+    // never looks above $4000.
+    //
+    //   $F000  magic $544D ("TM"), so a reader can tell it is really there
+    //   $F002  {13'b0, ph_slip, boot_ok, core_halted}
+    //   $F004  {13'b0, retries}   how many resets it took
+    //   $F006  milliseconds from the end of the power-up hold to the reset
+    //          release that finally worked. Add the hold itself (PWRUP_BIT)
+    //          for the figure from power-on.
+    //
+    // `make cfgdump` prints them. Log a few dozen cold starts and the delay
+    // question answers itself with numbers instead of blink-counting.
+    localparam [16:0] MS_TOP = 17'd85129;    // 1 ms at 85.13 MHz
+
+    reg [16:0] ms_div  = 17'd0;
+    reg [15:0] ms_cnt  = 16'd0;
+    reg [15:0] boot_ms = 16'd0;
+    reg        ext_reset_d = 1'b1;
+
+    always @(posedge clk) begin
+        ext_reset_d <= ext_reset;
+        if (!pwrup_done) begin
+            ms_div <= 17'd0;
+            ms_cnt <= 16'd0;
+        end else if (ms_div == MS_TOP) begin
+            ms_div <= 17'd0;
+            ms_cnt <= ms_cnt + 16'd1;
+        end else begin
+            ms_div <= ms_div + 17'd1;
+        end
+        // Latch on each release of the core; the last one to stick is the
+        // one that booted.
+        if (ext_reset_d && !ext_reset) boot_ms <= ms_cnt;
+    end
+
+    wire [63:0] tm_status = { boot_ms,                                 // $F006
+                              {12'd0, rtry_n},                         // $F004
+                              {12'd0, passive, ph_slip, boot_ok,
+                                       core_halted},                     // $F002
+                              16'h544D };                              // $F000
+
+    assign cpu_reset_n = (~core_oreset_n | rst_stretch | cold_rst | rtry_rst)
+                         ? 1'b0 : 1'bz;
+    assign cpu_halt_n  = (~core_ohalted_n | cold_rst | rtry_rst)
+                         ? 1'b0 : 1'bz;
 
     // ========================================================================
     // 8. fx68k core
@@ -466,7 +710,61 @@ module base64_top #(
     // holding /BR low with that condition deadlocks the bridge completely
     // -- zero bus cycles, machine dead, not merely slow. Any device that
     // parks /BR low, or a floating /BR, would hang the accelerator.
-    wire bus_released = ~s_bgack_n[1];
+    // ------------------------------------------------------------------
+    // 9b. Passive mode -- another accelerator takes the bus for good
+    //
+    // An SF2000 on the A500 expansion edge takes over by asserting and
+    // HOLDING /BR. It deliberately avoids /BGACK, because Gary adds a wait
+    // state to chip RAM cycles while /BGACK is asserted. On a B2000 it
+    // asserts /BOSS and Buster tri-states the CPU slot instead.
+    //
+    // With release conditioned on /BGACK alone we would keep driving the
+    // address, data and control lines into whatever the other accelerator is
+    // driving. That is contention, not a difference of opinion, and it is
+    // why this worked under the old 7 MHz firmware and does not now: that
+    // firmware released on /BG, and the note above records exactly why that
+    // was removed.
+    //
+    // Both behaviours are right, for different situations, so the
+    // discriminator is DURATION. A DMA requester asserts /BR for the length
+    // of a transfer; a takeover holds it from power-up and never lets go. We
+    // look once, over a window after the power-up hold, and commit.
+    //
+    // The CBTs stay OPEN for the whole decision window (bus_enable is gated
+    // on arb_settled), so there is no interval in which both boards drive.
+    // Deciding once and latching also means a later DMA burst cannot push us
+    // off the bus mid-session.
+    //
+    // /BR has a 10k pull-up and PULLMODE=UP, so a floating or absent signal
+    // reads negated and we take the bus normally -- the failure the note
+    // above warns about cannot happen by accident. PASSIVE_EN = 1'b0 removes
+    // the mechanism entirely.
+    // ------------------------------------------------------------------
+    localparam integer PASSIVE_BIT = 17;      // ~1.5 ms decision window
+
+    reg [17:0] arb_cnt     = 18'd0;
+    reg        arb_settled = 1'b0;
+    reg        passive     = 1'b0;
+    reg        br_all      = 1'b1;   // /BR held for the whole window so far
+
+    always @(posedge clk) begin
+        if (!pwrup_done) begin
+            arb_cnt     <= 18'd0;
+            arb_settled <= 1'b0;
+            passive     <= 1'b0;
+            br_all      <= 1'b1;
+        end else if (!arb_settled) begin
+            if (s_br_n[1]) br_all <= 1'b0;          // /BR let go at some point
+            if (arb_cnt[PASSIVE_BIT]) begin
+                arb_settled <= 1'b1;
+                passive     <= PASSIVE_EN & br_all & ~s_br_n[1];
+            end else begin
+                arb_cnt <= arb_cnt + 18'd1;
+            end
+        end
+    end
+
+    wire bus_released = ~s_bgack_n[1] | passive;
     wire bus_owned    = ~bus_released;
 
     // ========================================================================
@@ -777,7 +1075,10 @@ module base64_top #(
     assign cpu_bg_n  = bg_pin_n;
 
     reg bus_enable = 1'b0;
-    always @(posedge clk) bus_enable <= pwrup_done & bus_owned;
+    // arb_settled keeps the CBTs open until passive mode has been decided,
+    // so we never drive the bus during the window in which another
+    // accelerator might already own it.
+    always @(posedge clk) bus_enable <= pwrup_done & arb_settled & bus_owned;
     // Open the switchable CBTs on our own cycles so the CPU<->SDRAM traffic
     // is isolated from the motherboard bus.
     assign cbt_oe_d0_7_n   = ~bus_enable | fm_active | tm_active | sd_space;
@@ -1042,6 +1343,7 @@ module base64_top #(
         .ROM_AWID (12),           // 4096 words = 8 KB = 4 EBRs
         .ROM_FILE ("turbomem.mem")
     ) u_turbomem (
+        .status_i   (tm_status),
         .clk        (clk),
         .reset      (slave_reset),
         .cfgin_n    (ac_chain_n),
@@ -1262,7 +1564,23 @@ module base64_top #(
 
     assign led_g = LAT_DEBUG ? blink_on : e_div[20];
     assign led_r = ph_slip | ~core_ohalted_n;   // PLL slip / double bus fault
-    assign led_b = bus_enable;
+    // Blue: the core is OUT of reset. This is the diagnostic that matters at
+    // cold boot, because it separates the two failure modes:
+    //
+    //   blue never lights      the core never left reset. Either the pulse
+    //                          is not being issued, or cold_armed is still
+    //                          waiting because something is holding /RESET
+    //                          or /HALT low.
+    //   blue lights, red on    the core started and double bus faulted --
+    //                          it is running but cannot fetch. Look at OVL
+    //                          and the ROM overlay, not at reset.
+    //   blue lights, red off,
+    //   still no boot          the core is running into a machine that is
+    //                          in the wrong state.
+    //
+    // The previous cold_rst | bus_enable was useless: bus_enable takes over
+    // the instant cold_rst drops, so there was no visible transition.
+    assign led_b = ~ext_reset;
 
 endmodule
 

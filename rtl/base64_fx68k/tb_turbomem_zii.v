@@ -33,6 +33,7 @@ wire [3:0]  tm_ac_dout;
 wire        cfgout_n, tm_configured;
 wire [7:0]  tm_base;
 
+localparam [63:0] STAT_TEST = 64'h1234_0003_0006_544D;
 integer errors = 0;
 integer i;
 
@@ -48,7 +49,7 @@ turbomem_zii #(
 ) dut (
     .clk (clk), .reset (reset), .cfgin_n (cfgin_n),
     .as_n (as_n), .uds_n (uds_n), .lds_n (lds_n), .rw (rw),
-    .a (a), .d_in (d_in),
+    .a (a), .d_in (d_in), .status_i (STAT_TEST),
     .tm_space (tm_space), .tm_dout (tm_dout),
     .tm_dtack_n (tm_dtack_n), .tm_active (tm_active),
     .tm_ac_access (tm_ac_access), .tm_ac_dout (tm_ac_dout),
@@ -79,7 +80,7 @@ turbomem_zii #(
 ) dut2 (
     .clk (clk), .reset (reset), .cfgin_n (cfgout_n),
     .as_n (as_n), .uds_n (uds_n), .lds_n (lds_n), .rw (rw),
-    .a (a), .d_in (d_in),
+    .a (a), .d_in (d_in), .status_i (64'd0),
     .tm_space (tm2_space), .tm_dout (tm2_dout),
     .tm_dtack_n (tm2_dtack_n), .tm_active (tm2_active),
     .tm_ac_access (tm2_ac_access), .tm_ac_dout (tm2_ac_dout),
@@ -370,6 +371,19 @@ initial begin
     check("board 2 fully silent", {31'd0, claimed_low}, 32'd0);
     @(negedge clk);
     as_n = 1'b1; uds_n = 1'b1; lds_n = 1'b1;
+
+    // ---- 14. Status window at $F000 --------------------------------------
+    $display("\n[14] Status window at +$F000 does not disturb the ROM");
+    bus_read({8'h00, 8'hE9, 4'hF, 11'd0}, w);
+    check("magic at +$F000",  {16'd0, w}, 32'h0000544D);
+    bus_read({8'h00, 8'hE9, 4'hF, 10'd0, 1'b1}, w);
+    check("flags at +$F002",  {16'd0, w}, 32'h00000006);
+    bus_read({8'h00, 8'hE9, 4'hF, 9'd0, 2'b10}, w);
+    check("retries at +$F004",{16'd0, w}, 32'h00000003);
+    bus_read({8'h00, 8'hE9, 4'hF, 9'd0, 2'b11}, w);
+    check("boot_ms at +$F006",{16'd0, w}, 32'h00001234);
+    bus_read({8'h00, 8'hE9, 3'b001, 12'd0}, w);
+    check("ROM at +$2000 still intact", {16'd0, w}, {16'd0, gold[0]});
 
     $display("\n=== %0d error(s) ===\n", errors);
     if (errors == 0) $display("PASS\n"); else $display("FAIL\n");

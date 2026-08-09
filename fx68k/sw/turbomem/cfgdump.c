@@ -39,14 +39,24 @@
 
 struct ExecBase   *SysBase;
 struct DosLibrary *DOSBase;
-struct Library    *ExpansionBase;
+/* proto/expansion.h already declares this as struct ExpansionBase *, so the
+ * definition has to match or GCC reports conflicting types. OpenLibrary
+ * returns struct Library *, hence the cast at the call. */
+struct ExpansionBase *ExpansionBase;
 
-static void put_lit(const char *s)
-{
-    ULONG n = 0;
-    while (s[n]) n++;
-    if (n) Write(Output(), (CONST_APTR)s, (LONG)n);
-}
+/* A MACRO, not a function, and deliberately so.
+ *
+ * GCC at -O2 recognises a counting loop as strlen and emits a call to it.
+ * This toolchain is -nostdlib, so there is nothing to link that against, and
+ * writing strlen ourselves does not help -- the same loop idiom inside it
+ * would be turned into a recursive call to itself. Every use here is a string
+ * literal, so take the length at compile time and the problem cannot arise.
+ *
+ * The cost is that it must ONLY ever be given a literal. Handing it a char *
+ * would silently measure the pointer instead of the string. Where a runtime
+ * length is genuinely needed, call Write() directly, as dump_diagarea does
+ * for the board name. */
+#define put_lit(s) Write(Output(), (CONST_APTR)(s), (LONG)(sizeof(s) - 1))
 
 static void putch(UBYTE c asm("d0"), APTR data asm("a3"))
 {
@@ -70,18 +80,34 @@ static void cprintf(CONST_STRPTR fmt, ...)
         Write(Output(), (CONST_APTR)buf, n);
 }
 
+/* Read a word from a POSSIBLY ODD address, as two byte accesses.
+ *
+ * A UWORD access at an odd address is an address error on a 68000, and the
+ * SD card board advertises er_InitDiagVec = $0001 -- odd on purpose, because
+ * its diag area is byte-wide on the low data lane. The first version of this
+ * tool read a word there and took exactly the Software Error you would
+ * expect. Never dereference a board window at an alignment you have not
+ * checked. */
+static UWORD rdw(volatile UBYTE *p)
+{
+    return (UWORD)(((UWORD)p[0] << 8) | (UWORD)p[1]);
+}
+
 /* The DiagArea header, read back through the board window. Laid out by
  * hand rather than using struct DiagArea so the field offsets are visible
- * at the point of use -- this is the structure under investigation. */
-static void dump_diagarea(UBYTE *p, ULONG size_limit)
+ * at the point of use -- this is the structure under investigation.
+ *
+ * shift 0  word-wide: the information is contiguous.
+ * shift 1  byte-wide on the LOW lane: information byte n lives at address
+ *          offset 2n. An ODD er_InitDiagVec is what tells you so. */
+static void dump_diagarea(volatile UBYTE *p, ULONG span, UBYTE shift)
 {
     UBYTE  cfg   = p[0];
-    UBYTE  flags = p[1];
-    UWORD  size  = (UWORD)((p[2] << 8) | p[3]);
-    UWORD  diag  = (UWORD)((p[4] << 8) | p[5]);
-    UWORD  boot  = (UWORD)((p[6] << 8) | p[7]);
-    UWORD  name  = (UWORD)((p[8] << 8) | p[9]);
-    ULONG  i;
+    UBYTE  flags = p[1 << shift];
+    UWORD  size  = (UWORD)((p[2 << shift] << 8) | p[3 << shift]);
+    UWORD  diag  = (UWORD)((p[4 << shift] << 8) | p[5 << shift]);
+    UWORD  boot  = (UWORD)((p[6 << shift] << 8) | p[7 << shift]);
+    UWORD  name  = (UWORD)((p[8 << shift] << 8) | p[9 << shift]);
 
     cprintf((CONST_STRPTR)"    da_Config    $%02lx  ", (ULONG)cfg);
     switch (cfg & 0xC0) {
@@ -101,10 +127,17 @@ static void dump_diagarea(UBYTE *p, ULONG size_limit)
     cprintf((CONST_STRPTR)"    da_DiagPoint %ld\n",    (ULONG)diag);
     cprintf((CONST_STRPTR)"    da_BootPoint %ld%s\n",  (ULONG)boot,
             (CONST_STRPTR)(boot ? "" : "   <-- zero, nothing will be copied"));
+    if (shift) put_lit("    (byte-wide: fields read with stride 2)\n");
+
     cprintf((CONST_STRPTR)"    da_Name      %ld  \"",  (ULONG)name);
-    if (name && name < size && size <= size_limit) {
-        for (i = name; i < size && p[i]; i++)
-            cprintf((CONST_STRPTR)"%lc", (ULONG)p[i]);
+    if (name && name < size && ((ULONG)size << shift) <= span) {
+        char  tmp[80];
+        ULONG k = 0;
+        while (k < 79 && (name + k) < size && p[(name + k) << shift]) {
+            tmp[k] = (char)p[(name + k) << shift];
+            k++;
+        }
+        if (k) Write(Output(), (CONST_APTR)tmp, (LONG)k);
     }
     put_lit("\"\n");
 }
@@ -123,7 +156,8 @@ int _start(void)
     if (!DOSBase)
         return 20;
 
-    ExpansionBase = OpenLibrary((CONST_STRPTR)"expansion.library", 0);
+    ExpansionBase = (struct ExpansionBase *)
+        OpenLibrary((CONST_STRPTR)"expansion.library", 0);
     if (!ExpansionBase) {
         put_lit("cannot open expansion.library\n");
         CloseLibrary((struct Library *)DOSBase);
@@ -133,7 +167,8 @@ int _start(void)
     while ((cd = FindConfigDev(cd, -1, -1)) != NULL) {
         UBYTE  type = cd->cd_Rom.er_Type;
         UWORD  vec  = cd->cd_Rom.er_InitDiagVec;
-        UBYTE *base = (UBYTE *)cd->cd_BoardAddr;
+        volatile UBYTE *base = (volatile UBYTE *)cd->cd_BoardAddr;
+        UBYTE  shift = (UBYTE)((vec & 1) ? 1 : 0);
 
         n++;
         put_lit("\n");
@@ -156,20 +191,44 @@ int _start(void)
         /* First two words straight off the window, so an empty or stale ROM
          * is visible as data rather than as an absence of behaviour. */
         cprintf((CONST_STRPTR)"  window +$0000: %04lx %04lx\n",
-                (ULONG)*(volatile UWORD *)(base + 0),
-                (ULONG)*(volatile UWORD *)(base + 2));
+                (ULONG)rdw(base + 0), (ULONG)rdw(base + 2));
         cprintf((CONST_STRPTR)"  window +$%04lx: %04lx %04lx\n", (ULONG)vec,
-                (ULONG)*(volatile UWORD *)(base + vec),
-                (ULONG)*(volatile UWORD *)(base + vec + 2));
+                (ULONG)rdw(base + vec), (ULONG)rdw(base + vec + 2));
 
         put_lit("  DiagArea at cd_BoardAddr + er_InitDiagVec:\n");
-        dump_diagarea(base + vec, (ULONG)cd->cd_BoardSize - vec);
+        dump_diagarea(base + vec, (ULONG)cd->cd_BoardSize - vec, shift);
+
+        /* Boot statistics, if this board publishes them. The magic is what
+         * distinguishes a real status window from ROM mirrored into the top
+         * of the window, so check it before believing anything else. */
+        {
+            volatile UBYTE *st = base + 0xF000;
+            if (rdw(st) == 0x544D) {
+                UWORD fl = rdw(st + 2);
+                put_lit("  boot statistics:\n");
+                cprintf((CONST_STRPTR)"    resets needed  %ld\n",
+                        (ULONG)rdw(st + 4));
+                cprintf((CONST_STRPTR)"    booted at      %ld ms after the "
+                                     "power-up hold\n", (ULONG)rdw(st + 6));
+                cprintf((CONST_STRPTR)"    phase slip     %s\n",
+                        (CONST_STRPTR)((fl & 0x0004) ? "YES - the 7M phase "
+                                       "aligner re-acquired" : "no"));
+                cprintf((CONST_STRPTR)"    boot_ok        %s\n",
+                        (CONST_STRPTR)((fl & 0x0002) ? "yes" : "no"));
+                cprintf((CONST_STRPTR)"    core halted    %s\n",
+                        (CONST_STRPTR)((fl & 0x0001) ? "YES" : "no"));
+                cprintf((CONST_STRPTR)"    passive        %s\n",
+                        (CONST_STRPTR)((fl & 0x0008) ? "YES - another master "
+                                       "holds /BR, we are off the bus"
+                                     : "no"));
+            }
+        }
     }
 
     if (!n)
         put_lit("no autoconfig boards found\n");
 
-    CloseLibrary(ExpansionBase);
+    CloseLibrary((struct Library *)ExpansionBase);
     CloseLibrary((struct Library *)DOSBase);
     return 0;
 }

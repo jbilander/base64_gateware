@@ -132,7 +132,13 @@ module turbomem_zii #(
     // deliberately-unhurried figure autoconfig_zii.v uses. The EBR answers in
     // one clock; this is not a speed path. The diag area is read ONCE, at
     // boot, 101 words. Do not optimise it.
-    parameter [2:0]  ACK_CLKS  = 3'd7
+    parameter [2:0]  ACK_CLKS  = 3'd7,
+
+    // Publish four read-only status words at window offset $F000. The ROM is
+    // ROM_WORDS*2 bytes mirrored through the 64 KB window, so the top 4 KB is
+    // spare and expansion.library never reads above $4000. Costs one 4-bit
+    // compare and a 4:1 mux.
+    parameter        STATUS_EN = 1'b1
 )(
     input  wire        clk,          // 85.13 MHz core clock
     input  wire        reset,        // active high (ext_reset)
@@ -145,6 +151,7 @@ module turbomem_zii #(
     input  wire        rw,           // 1 = read
     input  wire [31:1] a,            // FULL internal address
     input  wire [15:0] d_in,         // core write data (oEdb)
+    input  wire [63:0] status_i,     // four words, low word at $F000
 
     // ---- ROM window slave (-> base64_top muxes) ----
     output wire        tm_space,    // this cycle belongs to the ROM window
@@ -319,6 +326,16 @@ initial $readmemh(ROM_FILE, rom);
 reg [15:0] rom_q;
 always @(posedge clk) rom_q <= rom[a[ROM_AWID:1]];
 
+// Status window. Registered alongside rom_q so both arrive together and the
+// output mux below is a plain select, not a second timing path.
+wire       status_hit = STATUS_EN && (a[15:12] == 4'hF);
+reg        status_sel;
+reg [15:0] status_q;
+always @(posedge clk) begin
+    status_sel <= status_hit;
+    status_q   <= status_i[{a[2:1], 4'b0000} +: 16];
+end
+
 // ---------------------------------------------------------------------------
 // DTACK for ROM cycles, and the read data hold.
 //
@@ -345,7 +362,7 @@ assign tm_dtack_n = ~tm_hold;
 // Freeze the EBR output once the cycle is acked, so tm_dout cannot move
 // under the core between DTACK and the core's latch point.
 always @(posedge clk) begin
-    if (!tm_hold) tm_dout <= rom_q;
+    if (!tm_hold) tm_dout <= status_sel ? status_q : rom_q;
 end
 
 endmodule
