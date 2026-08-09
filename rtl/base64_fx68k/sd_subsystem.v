@@ -36,7 +36,7 @@ module sd_subsystem #(
     input  wire         clk,        // 85.13 MHz core clock
     input  wire         reset,      // active high: ~s_reset_n[1] | ~pwrup_done
     // core-side bus (fx68k outputs, clk domain)
-    input  wire [23:1]  a,
+    input  wire [31:1]  a,          // FULL address -- see sd_space below
     input  wire         as_n,
     input  wire         uds_n,
     input  wire         lds_n,
@@ -63,7 +63,25 @@ module sd_subsystem #(
 
 wire ds_n = uds_n & lds_n;
 
-assign sd_space = sd_configured && (a[23:16] == base_sd) && !as_n;
+// Two Base64-specific changes to the SF2000 decode.
+//
+// The a[31:24] == $00 guard is REQUIRED here and cannot matter on the SF2000,
+// whose MC68SEC000 has only 24 address lines. fx68k drives A31-A24 and
+// fastmem_zii claims a[31:24] == $08 for the 16 MB CPU window, so without the
+// guard $08<base_sd>xxxx would be claimed by BOTH -- 64 KB of corruption
+// inside the 16 MB window, with two slaves driving iEdb and DTACK at once.
+//
+// The compare is REGISTERED and ANDed with the live as_n, the same
+// construction fastmem_zii uses for fm_space and turbomem_zii for tm_space.
+// This does NOT delay sd_space relative to AS -- the 68000 presents the
+// address at S1, two master clocks before AS falls -- so sdcard.v's ACCESS
+// contract is unchanged. It just keeps a 16-bit comparator out of the
+// combinational path into DTACK, which this design cannot afford.
+wire sd_hit = sd_configured && (a[31:16] == {8'h00, base_sd});
+reg  sd_hit_r;
+always @(posedge clk) sd_hit_r <= sd_hit;
+
+assign sd_space = sd_hit_r && !as_n;
 
 // ---------------------------------------------------------------------------
 // Boot ROM overlay enable — first write to the space switches reads from ROM

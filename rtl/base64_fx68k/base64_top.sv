@@ -39,9 +39,8 @@
 //
 // Pairs with base64_6x.fdc. Toolchain: Diamond / Synplify Pro.
 // fx68k ports match UPSTREAM ijor/fx68k (no E_rise/E_fall, eab[23:1]).
-// SDRAM and its autoconfig are live. The SD card device is still stripped
-// (see section 10c); its PORTS are kept so base64.lpf needs no edits, and the
-// hooks are marked "REATTACH" below.
+// SDRAM, the turbomem ROM board and the SD card device are all live. The
+// autoconfig chain is cfgin -> fastmem -> turbomem -> SD -> cfgout.
 // ============================================================================
 `default_nettype none
 
@@ -405,12 +404,15 @@ module base64_top #(
     wire [15:0] core_iedb  =
           fm_ac_oe ? {fm_ac_dout, 12'hFFF}
         : tm_ac_oe ? {tm_ac_dout, 12'hFFF}
+        : sd_ac_oe ? {sd_ac_dout, 12'hFFF}
         : fm_space ? fm_dout
         : tm_space ? tm_dout
+        : sd_space ? sd_dout
         : RETIME   ? (rt_av ? {8'h00, av_num} : rt_rd)
                    : (av_valid ? {8'h00, av_num} : rd_data);
     wire        int_dtack_lo  = ~fm_dtack_n | ~fm_ac_dtack_n
-                              | ~tm_dtack_n | ~tm_ac_dtack_n;
+                              | ~tm_dtack_n | ~tm_ac_dtack_n
+                              | ~sd_dtack_n | ~sd_ac_dtack_n;
     wire        core_dtack_n = ~((RETIME ? rt_dtack_lo : core_dtack_lo)
                                  | int_dtack_lo);
     wire        core_berr_n  = ~core_berr_lo;
@@ -778,8 +780,8 @@ module base64_top #(
     always @(posedge clk) bus_enable <= pwrup_done & bus_owned;
     // Open the switchable CBTs on our own cycles so the CPU<->SDRAM traffic
     // is isolated from the motherboard bus.
-    assign cbt_oe_d0_7_n   = ~bus_enable | fm_active | tm_active;
-    assign cbt_oe_d8_15_n  = ~bus_enable | fm_active | tm_active;
+    assign cbt_oe_d0_7_n   = ~bus_enable | fm_active | tm_active | sd_space;
+    assign cbt_oe_d8_15_n  = ~bus_enable | fm_active | tm_active | sd_space;
     assign cbt_oe_ctl_hi_n = ~bus_enable;
     assign cbt_oe_a8_17_n  = ~bus_enable;
     assign cbt_oe_a1_7_n   = ~bus_enable;
@@ -787,10 +789,14 @@ module base64_top #(
     // Autoconfig chain: transparent pass-through while our own boards are
     // stripped out, so downstream cards still configure. REATTACH here.
 
-    // Idled peripherals (ports retained so base64.lpf needs no edit)
-    assign sd_clk      = 1'b0;
-    assign sd_cmd      = 1'bz;
-    assign sd_d        = 4'bzzzz;
+    // SD card in SPI mode. DAT1/DAT2 are unused by the SPI protocol and are
+    // released rather than driven; DAT0 is an input (MISO) and DAT3 is chip
+    // select.
+    assign sd_clk      = sd_sclk_i;
+    assign sd_cmd      = sd_mosi_i;
+    assign sd_d[3]     = sd_ss_n_i;
+    assign sd_d[2:1]   = 2'bzz;
+    assign sd_d[0]     = 1'bz;
 
     // ========================================================================
     // 10b. RETIME mode -- SF2000-style pass-through
@@ -929,7 +935,14 @@ module base64_top #(
     wire [3:0]  tm_ac_dout;
     wire [7:0]  tm_base;
     wire        tm_configured;
-    wire        ac_chain_n;      // fastmem CFGOUT -> turbomem CFGIN
+    wire        sd_space, sd_dtack_n;
+    wire [15:0] sd_dout;
+    wire        sd_ac_access, sd_ac_oe, sd_ac_dtack_n;
+    wire [3:0]  sd_ac_dout;
+    wire [7:0]  base_sd;
+    wire        sd_configured;
+    wire        ac_chain_n;      // fastmem CFGOUT  -> turbomem CFGIN
+    wire        ac_chain2_n;     // turbomem CFGOUT -> SD CFGIN
     wire        sd_req, sd_we, sd_ack, sd_ready, sd_wr_valid, sd_ack_early;
     wire [15:0] sd_rdata_live;
     wire [23:0] sd_saddr;
@@ -948,8 +961,7 @@ module base64_top #(
     //   5194/11  SD card         reused from the SF2000 on purpose, so the
     //                            unmodified sfsd.device binds without a
     //                            driver fork. Registered to Niklas Ekstrom
-    //                            and Matt Harlum. Not instantiated yet --
-    //                            see the note in section 10c.
+    //                            and Matt Harlum.
     //   5194/13  Fast RAM        Zorro II, up to 8 MB
     //   5194/14  AutoConfig ROM  64 KB Zorro II I/O board carrying the
     //                            DiagArea that AddMemList()s the 16 MB at
@@ -1047,9 +1059,82 @@ module base64_top #(
         .tm_ac_dout   (tm_ac_dout),
         .tm_ac_oe     (tm_ac_oe),
         .tm_ac_dtack_n(tm_ac_dtack_n),
-        .cfgout_n     (cfgout_n),
+        .cfgout_n     (ac_chain2_n),
         .tm_base      (tm_base),
         .tm_configured(tm_configured)
+    );
+
+    // ---------------------------------------------------------------------
+    // SD card: autoconfig shell + subsystem, LAST on the chain.
+    //
+    // Both are Niklas Ekstrom's SF2000 design. The autoconfig register
+    // values and write semantics are byte-identical to it, which is the
+    // whole point -- the unmodified sfsd.rom / sfsd.device bind without a
+    // driver fork, and that is why this board keeps 5194/11 rather than
+    // taking an ID of its own.
+    //
+    // Two decode changes were needed for Base64 and are documented at the
+    // point of change in each file: the a[31:24] == $00 guard (fx68k drives
+    // A31-A24; the SF2000's MC68SEC000 physically cannot), and a registered
+    // address compare on sd_space.
+    //
+    // sfsd.mem is a 32 KB byte-wide image = 16 EBRs, taking the design from
+    // 5 to 21 of 56. Like turbomem.mem it MUST be a member of the Diamond
+    // project, and Clean deletes it from impl1/.
+    // ---------------------------------------------------------------------
+    autoconfig_zii #(
+        .MFG_ID     (16'h144A),
+        .SD_PROD_ID (8'd11),      // see the ID allocation block above
+        .SERIAL     (16'd0)
+    ) u_sd_autoconfig (
+        .clk          (clk),
+        .reset        (slave_reset),
+        .cfgin_n      (ac_chain2_n),
+        .as_n         (core_as_n),
+        .uds_n        (core_uds_n),
+        .lds_n        (core_lds_n),
+        .rw           (core_rw),
+        .a_high       (core_a[31:16]),
+        .a_low        (core_a[6:1]),
+        .d_in         (core_dout[15:12]),
+        .d_out        (sd_ac_dout),
+        .data_oe      (sd_ac_oe),
+        .ac_access    (sd_ac_access),
+        .base_sd      (base_sd),
+        .sd_configured(sd_configured),
+        .cfgout_n     (cfgout_n),
+        .dtack_n      (sd_ac_dtack_n)
+    );
+
+    // SPI-mode wiring onto the slot's SD pins: CLK -> SCLK, CMD -> MOSI,
+    // DAT0 -> MISO, DAT3 -> CS. DAT1/DAT2 are unused in SPI mode and left
+    // released. The slot has no card-detect line, so CD_n is tied asserted.
+    wire sd_ss_n_i, sd_sclk_i, sd_mosi_i;
+
+    sd_subsystem #(
+        .ROM_INIT_FILE("sfsd.mem")
+    ) u_sd (
+        .clk          (clk),
+        .reset        (slave_reset),
+        .a            (core_a),
+        .as_n         (core_as_n),
+        .uds_n        (core_uds_n),
+        .lds_n        (core_lds_n),
+        .rw           (core_rw),
+        .d_in         (core_dout),
+        .sd_configured(sd_configured),
+        .base_sd      (base_sd),
+        .sd_space     (sd_space),
+        .d_out        (sd_dout),
+        .dtack_n      (sd_dtack_n),
+        .rom_we       (1'b0),        // flash_preload not instantiated
+        .rom_waddr    (15'd0),
+        .rom_wdata    (8'd0),
+        .sd_miso      (sd_d[0]),
+        .sd_cd_n      (1'b0),
+        .sd_ss_n      (sd_ss_n_i),
+        .sd_sclk      (sd_sclk_i),
+        .sd_mosi      (sd_mosi_i)
     );
 
     wire sdram_clk_int;
@@ -1076,7 +1161,9 @@ module base64_top #(
     // A cycle that never reaches the motherboard. A missing term here is
     // silent and nasty: the retime FSM would drive AS out to the motherboard
     // for a cycle we are already answering on-chip.
-    wire int_space = fm_space | fm_ac_access | tm_space | tm_ac_access;
+    wire int_space = fm_space | fm_ac_access
+                   | tm_space | tm_ac_access
+                   | sd_space | sd_ac_access;
 
     // ========================================================================
     // 11b. Reveal debug bundle
