@@ -1268,10 +1268,10 @@ module base64_top #(
     //                            DiagArea that AddMemList()s the 16 MB at
     //                            $08000000
     //
-    // 13 and 14 are REQUESTED, NOT YET ASSIGNED. OAHR allocates product IDs
-    // and does not reserve them in advance, so these can still change until
-    // the application comes back. er_SerialNumber is 0 on every board, which
-    // is what the application declares.
+    // 13 and 14 were ASSIGNED to Base64 by OAHR in August 2026, and 12 went
+    // to SF2000, so the two projects hold contiguous blocks: SF2000 10-12,
+    // Base64 13-14. er_SerialNumber is 0 on every board, as declared in the
+    // application.
     // -----------------------------------------------------------------
     fastmem_zii #(.PROD_ID(8'd13), .OFFER_SPLIT(1'b1)) u_fastmem (
         .clk        (clk),

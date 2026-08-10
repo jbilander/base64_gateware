@@ -1,55 +1,172 @@
-# fx68k branch — build milestones
+# Building the fx68k gateware
 
-Prereqs: Diamond (Linux) with Synplify Pro, ecpprog + FT4232H on module JTAG.
-All milestones run on the bare iCESugar-Pro over USB power; no carrier needed
-until milestone 3 goes into a machine.
+How to get from a fresh clone to a bitstream. For what the design *is* —
+architecture, memory map, autoconfig layout, current status and known
+limitations — see [README.md](README.md).
+
+## What you need
+
+* **Lattice Diamond** (Linux) with **Synplify Pro**. Not LSE.
+* A **USB-C cable**. That is the whole toolchain for programming — see below.
+
+A JTAG adapter and `ecpprog` are **not** required. They are only worth setting
+up if you want Reveal Analyzer, and doing so costs you the easy route.
 
 ## Repo setup
+
     git clone -b fx68k --recurse-submodules git@github.com:jbilander/base64_gateware.git
-    (if cloned without submodules: git submodule update --init)
 
-## Milestone 1 — blink (verifies the whole flow)
+If you cloned without submodules: `git submodule update --init`
 
-Diamond: File > New > Project
-  - Device family ECP5, LFE5U-25F, package CABGA256, grade 6, part LFE5U-25F-6BG256C
-  - Synthesis tool: **Synplify Pro** (not LSE)
-  - Add source: rtl/blink/blink_top.v
-  - Add/import LPF: constraints/blink.lpf (replace the default blank one)
-  - Set top module: blink_top (Project > Active Implementation > Set Top-Level Unit)
-Run: double-click "Bitstream File" in the Process pane.
-Program:  ecpprog -d i:0x0403:0x6011 -I A -S <impl dir>/<project>_impl1.bit
-Expected: green LED blinking ~1.5 Hz. If yes: toolchain, LPF, JTAG all good.
+## Diamond project
 
-## Milestone 2 — fx68k fmax trial (answers the 42.5 MHz question)
+File > New > Project:
 
-New implementation (or project) with:
-  - rtl/fx68k/fx68k_pkg.sv, fx68k.sv, fx68kAlu.sv, uaddrPla.sv,
-    rtl/fx68k/bram/fx68kRegs_generic.sv, bram/fx68kRom_generic.sv
-  - rtl/common/pll_25_85.v
-  - rtl/fx68k_trial/fx68k_fmax_top.sv          (top: fx68k_fmax_top)
-  - constraints/fx68k_trial.lpf
-  - copy microrom.mem + nanorom.mem into the implementation directory
-    (Synplify resolves $readmemb relative to it; a missing file = CPU
-    that executes garbage with no error)
+* Device family **ECP5**, LFE5U-25F, package CABGA256, speed grade **6**,
+  part **LFE5U-25F-6BG256C** — the part on the iCESugar-Pro module.
+* Synthesis tool: **Synplify Pro** (not LSE).
+* Top-level unit: `base64_top` (Project > Active Implementation >
+  Set Top-Level Unit).
+* Constraints: `constraints/base64.lpf` — replace the blank default — and
+  `constraints/base64.fdc`.
 
-Run map + PAR, open the **Place & Route Trace** report (.twr):
-  - "FREQUENCY NET clk_sys 85.000000 MHz": PASS/FAIL and worst slack
-  - note the 5 worst paths (they tell us whether the documented
-    Ir->microAddr/nanoAddr multicycles are the fix or not)
+Sources: everything in `rtl/base64_fx68k/`, plus the fx68k core —
+`rtl/fx68k/fx68k_pkg.sv`, `fx68k.sv`, `fx68kAlu.sv`, `uaddrPla.sv`,
+`rtl/fx68k/bram/fx68kRegs_generic.sv` and `bram/fx68kRom_generic.sv` — and the
+SDRAM controller.
 
-Interpretation:
-  - PASS at 85 MHz          -> 42.5 MHz effective turbo is on the table
-  - FAIL, slack > -3 ns     -> try the commented MULTICYCLE lines +
-                               PAR strategy (more effort / timing-driven)
-  - FAIL, slack much worse  -> 21.3 MHz effective is the fx68k turbo
-                               ceiling here; compat mode unaffected either way
-On hardware the trial also sanity-runs the core: red until reset releases,
-then green toggling and blue flickering dimly (bus cycles executing).
+The fx68k sources are the **fredrequin fork with the three bug fixes applied**;
+see the core section of the README. An unfixed fork will not boot.
 
-## Milestone 3 — full socket top (compat mode, needs the carrier + Amiga)
+## Memory initialisation files — read this before the first build
 
-  - rtl/base64_fx68k/base64_top.sv + constraints/base64.lpf + fx68k sources
-  - NOTE: base64_top.sv was written against the upstream ijor port list;
-    the fredrequin fork adds eab[31:24] — connect eab[23:1], leave the
-    rest open, or take the small port-name diff from docs/ notes.
-  - PHASE_OFS in base64_top.sv is the 7M alignment trim (see docs/clocking.md)
+Four `.mem` files are loaded by `$readmemh`/`$readmemb` at synthesis:
+
+| File | |
+| --- | --- |
+| `microrom.mem`, `nanorom.mem` | fx68k microcode |
+| `turbomem.mem` | the DiagArea ROM that calls `AddMemList` |
+| `sfsd.mem` | the SD card boot ROM |
+
+**All four must be members of the Diamond project**, and they resolve against
+the directory synthesis runs in — the implementation directory, not the RTL
+tree. Putting them in `rtl/` is not enough.
+
+**Diamond's Clean deletes them from `impl1/`.** Reinstate them afterwards.
+`make install-mem` in `sw/turbomem` handles `turbomem.mem` and takes an
+`IMPLDIR=` override if your path differs.
+
+When one is missing the failure is silent and convincing: the array
+constant-folds to zero, Synplify prunes the read register, and the design
+builds and runs while that ROM serves nothing but zeroes. A missing
+`microrom.mem` gives a CPU that executes garbage with no error at all.
+
+## Strategy settings
+
+These meet timing. The design has little margin, so they matter:
+
+```
+Path-based Placement            Off
+Placement Effort Level          5
+Placement Iteration Start Pt    2
+Placement Iterations            20
+Placement Sort Best Run         Worst Slack
+Routing Delay Reduction Passes  10
+Routing Passes                  20
+Routing Resource Optimization   6
+```
+
+**Do not turn Path-based Placement on.** It is catastrophic here — 4096 of
+4096 items failing at -1.870 ns, with the microcode address path dominant.
+With it off the same design closes.
+
+Expect to re-run place and route after any change: placement variance between
+builds is larger than the margin.
+
+## Check the build log
+
+```sh
+grep -c CG371 <log>                  # $readmemh data file not found -- must be 0
+grep -c CS101 <log>                  # index out of range           -- must be 0
+grep -c BN105 <log>                  # must be 0
+grep -m1 'Number of SLICEs'          # ~5000. If it says ~29, the design collapsed
+grep -m1 'Number of block RAMs'      # 21 of 56. Fewer means a .mem did not load
+```
+
+Then the Place & Route Trace report (`.twr`): hold errors first, then setup.
+Both must be zero.
+
+The resource counts are the checks that cannot be misread — a `CS101` from a
+parameter indexing past the end of a counter once produced a 29-SLICE
+bitstream that held /RESET low forever, and the SLICE count would have caught
+it instantly.
+
+## Programming
+
+> ### Program the module OUT of the Amiga
+>
+> Do it before seating the module in the SO-DIMM DDR2 socket.
+>
+> The iCESugar-Pro has **no protection between its 5V rail and USB 5V**, so
+> plugging in USB while the module is installed ties the Amiga's 5V to the
+> host's with nothing in between, and whichever is higher back-drives the
+> other. In practice USB is closer to a true 5.0V while the Amiga usually
+> sits nearer 4.9V, so the direction ends up being your PC powering the
+> Amiga's 5V rail rather than the reverse — which is not what you want
+> either. Two unprotected supplies tied together is not a state to leave a
+> machine in, whichever way the current happens to flow.
+>
+> If you need USB attached while the module is installed — capturing with
+> Reveal, for instance — use a **data-only cable** with the 5V conductor
+> cut, leaving D+, D- and GND. Check the 5V pin on the JTAG header the same
+> way if your external adapter drives it rather than just sensing it.
+
+### Normally: drag and drop
+
+Plug a USB-C cable from your PC into the module. The on-board **iCELink**
+debugger (DAPLink-based) appears as a virtual disk. Drop
+`prj/base64_fx68k/impl1/base64_fx68k_impl1.bit` onto it and wait a few
+seconds while it programs the SPI flash. That is all — no adapter, no
+`ecpprog`, no drivers.
+
+Muse Lab's `icesprog` tool does the same from the command line if you prefer.
+
+### With an external JTAG adapter
+
+Only needed if you want **Reveal Analyzer**, which requires the ECP5's native
+JTAG, and the iCELink drives those same pins.
+
+**This is a hardware modification.** To use an external adapter you must
+disable the iCELink by connecting the designated pad — near the 3.3V rail by
+the JTAG header — to GND. Once you do, **drag-and-drop programming stops
+working** and the adapter becomes the only way in. Do not do this unless you
+actually need on-chip debug.
+
+The 6-pin header next to it is, in order: 5V, TDO, TDI, TMS, TCK, GND.
+
+With the adapter connected, to SPI flash:
+
+    ecpprog -d i:0x0403:0x6010 -I A prj/base64_fx68k/impl1/base64_fx68k_impl1.bit
+
+Add `-S` to load SRAM instead: volatile, lost on power-off, but much faster
+for iterating.
+
+Check the VID:PID against your adapter — FT2232H is `0x6010`, FT4232H is
+`0x6011`.
+
+## If the flow itself is suspect
+
+`rtl/blink/blink_top.v` with `constraints/blink.lpf` is a minimal design that
+runs on a bare iCESugar-Pro over USB power, no carrier needed. Top module
+`blink_top`; a green LED blinking at roughly 1.5 Hz means Diamond, the LPF and
+your programming route are all working. Worth doing once on a new machine
+before blaming the real design.
+
+---
+
+*Historical: this file used to carry an fx68k fmax trial as milestone 2, to
+find out whether 42.5 MHz effective was reachable. It is, and the design runs
+there — 85.13 MHz master clock, 6x effective — so the trial has been removed.
+The note about connecting only `eab[23:1]` has gone too: the design now uses
+the full 32-bit address bus, decoding `a[31:24] == $08` for the CPU-space
+window.*
