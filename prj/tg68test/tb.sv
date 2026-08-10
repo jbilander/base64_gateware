@@ -25,7 +25,7 @@ module tb(
 m68k_clocks clocks;
 hostclocks hostclocks (
 	.clk7(clk7),
-	.clk2x(clk2x),
+	.clk85(clk2x),
 	.fpgaclk(clk2x),
 	.cpu_clocks(clocks)
 );

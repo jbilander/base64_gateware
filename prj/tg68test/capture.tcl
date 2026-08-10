@@ -36,41 +36,21 @@ puts "Setting TAP, capture fields and length"
 
 # sendreset 1
 
-#::jcapture::settrigger edge reset_n 1
-#::jcapture::settrigger mask reset_n 1
-#::jcapture::settrigger value reset_n 1
-
 ::jcapture::settrigger edge clkena 1
 ::jcapture::settrigger mask clkena 1
 ::jcapture::settrigger value clkena 1
 
 ::jcapture::settrigger edge screenwhite 0
 ::jcapture::settrigger mask screenwhite 0
-::jcapture::settrigger value screenwhite 1
+::jcapture::settrigger value screenwhite 0
 
-#::jcapture::settrigger edge addr 0x00000000
-#::jcapture::settrigger mask addr 0xffffff00
-#::jcapture::settrigger value addr 0xffffffff
+::jcapture::settrigger edge addr 0x00000000
+::jcapture::settrigger mask addr 0x00020000
+::jcapture::settrigger value addr 0x00e80000
 
-#::jcapture::settrigger edge dout 0x0000
-#::jcapture::settrigger mask dout 0xffff
-#::jcapture::settrigger value dout 0x0fff
-
-#::jcapture::settrigger edge cpustate 0
-#::jcapture::settrigger mask cpustate 3
-#::jcapture::settrigger value cpustate 2
-
-#::jcapture::settrigger edge sd_cas 0
-#::jcapture::settrigger mask  sd_cas 1
-#::jcapture::settrigger value sd_cas 1
-
-#::jcapture::settrigger edge sd_ras 1
-#::jcapture::settrigger mask  sd_ras 1
-#::jcapture::settrigger value sd_ras 0
-
-#::jcapture::settrigger edge bootrom_ena 1
-#::jcapture::settrigger mask bootrom_ena 1
-#::jcapture::settrigger value bootrom_ena 0
+::jcapture::settrigger edge cpustate 0
+::jcapture::settrigger mask cpustate 0x3
+::jcapture::settrigger value cpustate 0x2
 
 ::jcapture::setsubsample 0
 
@@ -80,7 +60,7 @@ puts "Recording to cap.vcd"
 #	sendreset 0
 
 	set chan [::jcapture::create_vcd cap.vcd 0]
-	::jcapture::setleadin 0
+	::jcapture::setleadin 1
 
 	::jcapture::capture
 	# Release reset, 

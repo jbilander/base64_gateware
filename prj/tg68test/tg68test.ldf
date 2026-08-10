@@ -2,39 +2,39 @@
 <BaliProject version="3.2" title="tg68test" device="LFE5U-25F-6BG256C" default_implementation="impl1">
     <Options/>
     <Implementation title="impl1" dir="impl1" description="impl1" synthesis="synplify" default_strategy="Strategy1">
-        <Options top="base64_icesugarpro_top"/>
+        <Options def_top="autoconfig_rom" top="base64_icesugarpro_top"/>
         <Source name="../../fpga/icesugarpro_board_pkg.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/sdram_pkg.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/base64_m68k_pkg.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/cpu_pkg.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/m68k_bridge.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../fpga/base64_icesugarpro_top.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../pll/ecp5_25MHz_100MHz/supervisorclk/supervisorclk.sbx" type="sbx" type_short="SBX">
             <Options/>
         </Source>
         <Source name="../../rtl/hostclocks.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/jtag/vjtag_sync_fifo.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/jtag/vjtag_ecp5.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/jtag/jcapture.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/jtag/jtaggwrapper.v" type="Verilog" type_short="Verilog">
             <Options/>
@@ -46,22 +46,22 @@
             <Options/>
         </Source>
         <Source name="../../rtl/cpu_probe.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/sdram.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/tg68wrapper.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="virtualtoplevel.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="Firmware_ROM.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/peripherals/uart.sv" type="Verilog" type_short="Verilog">
-            <Options/>
+            <Options VerilogStandard="System Verilog"/>
         </Source>
         <Source name="../../rtl/tg68_lattice/TG68KdotC_Kernel.vhd" type="VHDL" type_short="VHDL">
             <Options/>
@@ -70,6 +70,12 @@
             <Options/>
         </Source>
         <Source name="../../rtl/peripherals/spi.sv" type="Verilog" type_short="Verilog">
+            <Options VerilogStandard="System Verilog"/>
+        </Source>
+        <Source name="../../rtl/autoconfig/autoconfig.v" type="Verilog" type_short="Verilog">
+            <Options/>
+        </Source>
+        <Source name="../../rtl/autoconfig/autoconfig_rom.vhd" type="VHDL" type_short="VHDL">
             <Options/>
         </Source>
         <Source name="../../fpga/base64_icesugarpro.lpf" type="Logic Preference" type_short="LPF">

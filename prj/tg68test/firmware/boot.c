@@ -96,15 +96,14 @@ int main(int argc,char **argv)
 	DIRENTRY *dir=0;
 	int i;
 
-	if(LoadROM("DIAGROM ROM")) {
-//	if(LoadROM("KICK    ROM")) {
-//		if((*ciaapra) & 64)
-//			BootStock();
-//		else
-//			BootSoftKick();
+//	if(LoadROM("DIAGROM ROM")) {
+	if(LoadROM("KICK    ROM")) {
+		BootSoftKick();
 	}
-//	else
-//		printf("ROM loading failed\n");
+	else {
+		printf("ROM loading failed\n");
+		BootStock();
+	}
 
 	while(1) {
 		int c=getchar()&(~32);

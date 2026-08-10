@@ -38,7 +38,10 @@ jcapture #(
 	.reset_n(clocks.reset_n_sys), // clocks.reset_n_sys),
 	.capture_d(jtag_d),
 	.user_q(jtag_q),
-	.user_update(jtag_update)
+	.user_update(jtag_update),
+    .user_d(0),
+    .user_ir(),
+    .user_ir_update()
 );
 
 assign jtag_d[0] = clocks.clk7;

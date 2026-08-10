@@ -72,7 +72,7 @@ m68k_bridge bridge (
 // JTAG capture module to monitor the cpu
 wire [0:0] jtag_q;
 wire jtag_update;
-wire interrupt = &socket_miscin.ipl;
+//wire interrupt = &socket_miscin.ipl;
 //cpu_probe #(.outwidth(1)) probe (
 //    .clocks(clocks),
 //    .m_addr(socket_addr_ctrl),

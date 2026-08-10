@@ -19,4 +19,19 @@ typedef struct {
 	bit drive;
 } sdram_out;
 
+typedef struct {
+	bit req;
+	bit burst;
+	bit [SDRAM_ROW_BITS+SDRAM_COLUMN_BITS+2:0] addr;
+	bit [15:0] d;
+	bit [1:0] dm;
+	bit we;
+} sdram_request;
+
+typedef struct {
+	bit ack;
+	bit fill;
+	bit [15:0] q;
+} sdram_response;
+
 endpackage

@@ -37,8 +37,10 @@ typedef enum logic[3:0] {
 	WAIT_INTERNAL,
 	PERIPHERAL,
 	FASTRAM,
+	AUTOCONFIG,
 	ROM,
-	SPI
+	SPI,
+	CLKENA
 } state_t;
 
 state_t state=RESET;
@@ -79,8 +81,16 @@ reg  tg68_reset_in;
 // (Maybe Akiko at 0xb80000 for C2P converter?)
 
 
-// These two are critical timewise, so we generate them combinationally:
-wire sel_fast24 = tg68_addr[31:24] == 8'h0 && (tg68_addr[23:20] == 4'h2) ? 1'b1 : 1'b0;
+// These are critical timewise, so we generate them combinationally:
+
+wire sel_24bit = tg68_addr[31:24] == 8'h0 ? 1'b1 : 1'b0;
+wire sel_fast24_2 = tg68_addr[23:21] == 3'h1 ? 1'b1 : 1'b0; // 0x200000 - 0x3fffff
+wire sel_fast24_4 = tg68_addr[23:21] == 3'h2 ? 1'b1 : 1'b0; // 0x400000 - 0x5fffff
+wire sel_fast24_6 = tg68_addr[23:21] == 3'h3 ? 1'b1 : 1'b0; // 0x600000 - 0x7fffff
+wire sel_fast24_8 = tg68_addr[23:21] == 3'h4 ? 1'b1 : 1'b0; // 0x800000 - 0x9fffff
+
+wire sel_fast24 = sel_24bit & (sel_fast24_2 | sel_fast24_4 | sel_fast24_6 | sel_fast24_8);
+
 wire sel_fast32 = tg68_addr[31:27] == 5'h0 && tg68_addr[26]==1'b1 ? 1'b1 : 1'b0;
 
 // The rest can be handled on a more relaxed schedule, so we use a latched copy
@@ -106,7 +116,7 @@ reg softkick_ena;
 reg softkick_overlay;
 
 wire sel_slowram = tg68_addr_d[31:20] == 12'h00c ? 1'b1 : 1'b0;
-wire sel_autoconfig = tg68_addr_d[31:16] == 16'h00b8 ? 1'b1 : 1'b0;
+wire sel_autoconfig = ((!ac_done) && (tg68_addr_d[31:16] == 16'h00e8)) ? 1'b1 : 1'b0;
 wire sel_bootrom = tg68_addr_d[31:16] == 16'h0000 && bootrom_ena ? 1'b1 : 1'b0;
 wire sel_kickoverlay = tg68_addr_d[31:16] == 16'h0000 && softkick_ena && softkick_overlay ? 1'b1 : 1'b0;
 wire sel_softkick = (tg68_addr_d[31:20] == 12'hfff || tg68_addr_d[31:20] == 12'h00f) && tg68_addr_d[19]==1'b1 && softkick_ena ? 1'b1 : 1'b0;
@@ -126,7 +136,7 @@ reg jtag_user_wr;
 reg jtag_user_stb;
 
 // JTAG SDRAM select signals
-wire jtag_sel_fast24 = jtag_user_addr[31:24] == 8'h0 && (jtag_user_addr[23:20] == 4'h2) ? 1'b1 : 1'b0;
+wire jtag_sel_fast24 = jtag_user_addr[31:24] == 8'h0 && (jtag_user_addr[23:20] == 4'h2) ? 1'b1 : 1'b0; // FIXME - decode up to 8 meg here
 wire jtag_sel_fast32 = jtag_user_addr[31:27] == 5'h0 && jtag_user_addr[26]==1'b1 ? 1'b1 : 1'b0;
 
 
@@ -225,20 +235,17 @@ spi spi_inst (
 // SDRAM 
 
 wire sdram_ready;
-wire sdram_ack;
-wire [15:0] sdram_to_cpu;
-reg sdram_cs;
-reg sdram_we;
-wire [24:0] sdram_addr;
-reg [15:0] sdram_from_cpu;
-reg [1:0] sdram_ds;
 
-assign sdram_addr[18:0] = tg68_addr_d[18:0];
-assign sdram_addr[24:19] = sel_kickoverlay ? 6'h3f :
-                           sel_softkick ? 6'h3f :
-                           tg68_addr_d[24:19];
+sdram_request sdr_req[0:0];
+sdram_response sdr_resp[0:0];
+
+assign sdr_req[0].addr[18:0] =  tg68_addr_d[18:0];
+assign sdr_req[0].addr[24:19] = sel_kickoverlay ? 6'h3f :
+                             sel_softkick ? 6'h3f :
+                             tg68_addr_d[24:19];
 
 sdram #(
+	.ports(1),
 	.sysclk_freq(sysclk_freq)
 ) sdram_ctrl (
 	.sd_in(sdr_in),
@@ -247,13 +254,9 @@ sdram #(
 	.clk(clocks.sysclk),
 	.reset_n(clocks.reset_n_sys),
 	.ready(sdram_ready),
-	.din(sdram_from_cpu),
-	.dout(sdram_to_cpu),
-	.addr(sdram_addr),
-	.ds(sdram_ds),
-	.cs(sdram_cs),
-	.we(sdram_we),
-	.ack(sdram_ack)
+
+	.port_req(sdr_req),
+	.port_resp(sdr_resp)
 );
 
 // CPU to peripheral bridge state machine
@@ -265,6 +268,25 @@ reg jtag_romsel_stb;
 reg jtag_romsel;
 
 reg cpureset_d;
+
+reg [15:0] ac_d;
+wire [15:0] ac_q;
+reg ac_wr;
+wire ac_done;
+
+// Autoconfig module
+autoconfig ac_inst (
+	.clk(clocks.sysclk),
+	.reset_n(sm_reset),
+	.address_in(tg68_addr_d[8:1]),
+	.data_out(ac_q),
+	.data_in(ac_d),
+	.wr(ac_wr),
+	.fastram_config(2'b10),
+	.m68020(1'b0),
+	.board_configured(),
+	.autoconfig_done(ac_done)
+);
 
 always @(posedge clocks.sysclk) begin
 	clkena <= 1'b0;
@@ -288,7 +310,8 @@ always @(posedge clocks.sysclk) begin
 			cpu_req.req <= 1'b0;
 			clkena <= 1'b0;
             tg68_reset_in <= 1'b0;
-            sdram_cs <= 1'b0;
+            sdr_req[0].req <= 1'b0;
+			sdr_req[0].burst <= 1'b0;
 			state <= INIT;
 		end
 
@@ -305,15 +328,18 @@ always @(posedge clocks.sysclk) begin
 					state <= REQ;
 				end
 			end else begin
-				if(slower[0] && !clkena) begin
-					if(tg68_state == STATE_INTERNAL) begin
+				if(tg68_state == STATE_INTERNAL) begin
+					if(slower[1] && !clkena) begin
 						clkena <= 1'b1;
 						state <= WAIT_INTERNAL;
-					end else if(sel_fast24 || sel_fast32) begin // We need to handle Fast RAM requests as promptly as possible
-						sdram_we <= tg68_state == STATE_WRITE ? 1'b1 : 1'b0;
-						sdram_from_cpu <= tg68_dout;
-						sdram_ds <= {tg68_uds,tg68_lds};
-						sdram_cs <= 1'b1;
+					end
+				end else if(slower[1] && !clkena) begin
+					if(sel_fast24 || sel_fast32) begin // We need to handle Fast RAM requests as promptly as possible
+						sdr_req[0].we <= tg68_state == STATE_WRITE ? 1'b1 : 1'b0;
+						sdr_req[0].d <= tg68_dout;
+						sdr_req[0].dm <= {tg68_uds,tg68_lds};
+						sdr_req[0].burst <= 1'b0;
+						sdr_req[0].req <= 1'b1;
 						state <= FASTRAM;
 					end else begin
 						state <= REQ;	// Handle other requests a cycle later
@@ -323,18 +349,18 @@ always @(posedge clocks.sysclk) begin
 		end
 		
 		FASTRAM : begin
-			if(sdram_ack) begin
-				sdram_cs <= 1'b0;
+			if(sdr_resp[0].ack) begin
+				sdr_req[0].req <= 1'b0;
 				case(selecteddevice)
 					DEVICE_JTAG : begin
-							jtag_user_d <= sdram_to_cpu;
+							jtag_user_d <= {16'b0,sdr_resp[0].q};
 							selecteddevice <= DEVICE_CPU;
 							jtag_user_ack <= jtag_user_req;
 							jtag_user_stb <= 1'b1;
 							state <= WAIT_INTERNAL;
 						end
 					default : begin
-							tg68_din <= sdram_to_cpu;
+							tg68_din <= sdr_resp[0].q;
 							clkena <= 1'b1;
 							state <= DECODE;
 						end
@@ -405,8 +431,15 @@ always @(posedge clocks.sysclk) begin
 				bootrom_bs <= {~tg68_uds,~tg68_lds};
 				bootrom_we <= ~tg68_wr;
 				state <= ROM;
-			end else if(sel_autoconfig) begin
 
+			end else if(sel_autoconfig && !ac_done) begin
+				// Autoconfig - once we've configured our own devices
+				// the autoconfig address range goes to the motherboard
+				// where any "real" autoconfig devices will be configured
+				// as usual.
+				ac_wr<=(tg68_state == STATE_WRITE) ? 1'b1 : 1'b0;
+				ac_d <= tg68_dout;
+				state <= AUTOCONFIG;
 
 			end else if(sel_slowram) begin // Temporarily disable slowram
 
@@ -415,9 +448,9 @@ always @(posedge clocks.sysclk) begin
 				state <= DECODE;
 
 			end else if(sel_kickoverlay || sel_softkick) begin
-				sdram_we <= 1'b0;
-				sdram_ds <= 2'b00;
-				sdram_cs <= 1'b1;
+				sdr_req[0].we <= 1'b0;
+				sdr_req[0].dm <= 2'b00;
+				sdr_req[0].req <= 1'b1;
 				state <= FASTRAM;
 			end else begin
 
@@ -427,13 +460,13 @@ always @(posedge clocks.sysclk) begin
 				cpu_req.addr <= tg68_addr_d;
 				if(selecteddevice==DEVICE_JTAG) begin
 					if(jtag_sel_fast24 || jtag_sel_fast32) begin // SDRAM
-						sdram_we <= jtag_user_wr;
-						sdram_from_cpu <= jtag_user_q;
-						sdram_ds <= 2'b00;
-						sdram_cs <= 1'b1;
+						sdr_req[0].we <= jtag_user_wr;
+						sdr_req[0].d <= jtag_user_q[15:0];
+						sdr_req[0].dm <= 2'b00;
+						sdr_req[0].req <= 1'b1;
 						state <= FASTRAM;
 					end else begin
-						cpu_req.d <= jtag_user_q;
+						cpu_req.d <= jtag_user_q[15:0];
 						cpu_req.dm <= 2'b11; // Probably don't need byte-level access over JTAG.
 						cpu_req.wr <= jtag_user_wr;
 						cpu_req.ifetch <= 1'b0;
@@ -475,6 +508,12 @@ always @(posedge clocks.sysclk) begin
 		
 		end
 
+		AUTOCONFIG : begin
+			tg68_din <= ac_q;
+			ac_wr <= 1'b0;
+			state <= CLKENA;
+		end
+
 		SPI : begin
 			if(!spi_busy) begin
 				tg68_din <= {8'd0,spi_q};
@@ -487,7 +526,7 @@ always @(posedge clocks.sysclk) begin
 			if(slower[0] && (cpu_resp.ack==cpu_req.req)) begin
 				case(selecteddevice)
 					DEVICE_JTAG : begin
-							jtag_user_d <= cpu_resp.q;
+							jtag_user_d <= {16'b0,cpu_resp.q};
 							selecteddevice <= DEVICE_CPU;
 							jtag_user_ack <= jtag_user_req;
 							jtag_user_stb <= 1'b1;
@@ -495,11 +534,16 @@ always @(posedge clocks.sysclk) begin
 						end
 					default : begin
 							tg68_din <= cpu_resp.q;
-							clkena <=1'b1;
-							state <= DECODE;
+							// clkena <=1'b1;
+							state <= CLKENA;
 						end
 				endcase
 			end
+		end
+
+		CLKENA: begin
+			clkena <=1'b1;
+			state <= DECODE;
 		end
 
 		WAIT_INTERNAL :
@@ -534,12 +578,23 @@ always @(posedge clocks.sysclk) begin
 
 end
 
+reg [2:0] ipl;
+reg [2:0] ipl_prev;
+
+always @(posedge clocks.sysclk) begin	// Sample IPL on the clk7 posedge and do some basic filtering.
+	if(clocks.clk7_en_p) begin
+		ipl_prev <= socket_miscin.ipl;
+		if(socket_miscin.ipl==ipl_prev)
+			ipl <= ipl_prev;
+	end
+end
+
 TG68KdotC_Kernel tg68 (
 	.clk(clocks.sysclk),
 	.nReset(tg68_reset_in),
 	.clkena_in(clkena),
 	.data_in(tg68_din),
-	.IPL(socket_miscin.ipl),
+	.IPL(ipl),
 	.IPL_autovector(1'b0),
 	.berr(1'b0),
 	.CPU(2'b11),
@@ -570,7 +625,7 @@ end
 // JTAG capture module to monitor the cpu bus lines
 // Capturewidth must be wide enough to accommodate
 // the command set for remote 
-localparam capturewidth = 53;
+localparam capturewidth = 43;
 localparam capturedepth = 12;
 wire [capturewidth-1:0] jtag_d;
 wire [capturewidth-1:0] jtag_q;
@@ -579,10 +634,11 @@ wire jtag_update;
 assign jtag_d[1:0] = tg68_state;
 assign jtag_d[2] = tg68_reset_in;
 assign jtag_d[34:3] = tg68_addr_d;
-assign jtag_d[50:35] = tg68_dout;
-assign jtag_d[51] = clkena;
-assign jtag_d[52] = screenwhite;
-
+assign jtag_d[35] = socket_miscin.dtack;
+assign jtag_d[39:36] = state;
+assign jtag_d[40] = sel_autoconfig;
+assign jtag_d[41] = clkena;
+assign jtag_d[42] = 1'b0; // Eaten by compression
 
 /* The capture happens one clock after trigger conditions are met.
    Delaying the clkena stb by a couple of cycles means the data
@@ -606,7 +662,7 @@ jcapture #(
 	.capture_d(jtag_d),
 	.user_ir(user_ir),
 	.user_ir_update(),
-	.user_d(jtag_user_d),
+	.user_d({11'b0,jtag_user_d}),
 	.user_q(jtag_q),
 	.user_update(jtag_update)
 );
@@ -645,7 +701,7 @@ always @(posedge clocks.sysclk) begin
 
 			usercmd_write : begin
 				jtag_user_wr <= 1'b1;
-				jtag_user_q <= jtag_q;
+				jtag_user_q <= jtag_q[31:0];
 				jtag_user_req <= ~jtag_user_ack;
 			end
 

@@ -4,12 +4,18 @@ import sdram_pkg::*;
 
 `default_nettype none
 
+`define REVISION_B
+`undef REVISION_C
+
 module base64_icesugarpro_top (
 	input clk_i,
 	
-	// 7MHz and 14MHz clocks
-	input clk,
-	input clk2x,
+	// 7MHz and 14MHz / 85MHz clocks
+	input clk_7m_revc,
+	input clk_12x_revc,
+
+	input clk_7m_revb,
+	input clk_2x_revb,
 		
 	// Address bus
 	output a_hi_oe, // Covers a[23:18], rw, lds, uds & as
@@ -108,20 +114,36 @@ assign spisdcard_cs_n = spi_cs;
 assign spi_cipo = spisdcard_miso;
 `endif
 
-// Clocking
+wire clk7in;
+wire clkfastin;
+
+`ifdef REVISION_B
+	`ifdef REVISION_C
+		assign clk7in = CANT_DEFINE_BOTH_REVB_AND_REVC;
+	`else
+		assign clk7in = clk_7m_revb;
+		assign clkfastin = clk_2x_revb;
+	`endif
+`else
+	`ifdef REVISION_C
+		assign clk7in = clk_7m_revc;
+		assign clkfastin = clk_12x_revc;
+	`else
+		assign clk7in = MUST_DEFINE_EITHER_REVB_OR_REVC;
+	`endif
+`endif
+
 m68k_clocks clocks;
-wire clk7out;
-hostclocks hostclocks (
-	.clk7(clk),
-	.clk2x(clk2x),
+
+// Clocking - FIXME, if we start using the fast clock, select multiplier based on board revision.
+hostclocks #(.phase(1)) hostclocks (
+	.clk7(clk7in),
+	.clk85(clkfastin),
 	.fpgaclk(clk_i),
-	.cpu_clocks(clocks),
-	.clk7out(clk7out)
+	.cpu_clocks(clocks)
 );
+
 assign sdram_clk=clocks.ramclk;
-
-assign bg = clk7out;
-
 
 // ToDo - run a frequency counter on the incoming 25MHz clock to check that the generated
 // sysclock is within acceptable bounds.
@@ -153,7 +175,7 @@ assign d_lo_oe = ~data_out.dq_en;
 // Misc inputs 
 
 m68k_misc_in misc_in;
-assign misc_in.clk = clk;
+assign misc_in.clk = clk7in;
 assign misc_in.dtack = dtack;
 assign misc_in.ipl = ipl;
 assign misc_in.halt = halt;
@@ -169,7 +191,7 @@ assign misc_in.reset = reset;
 m68k_misc_out misc_out;
 assign fc = misc_out.fc;
 assign vma = misc_out.vma;
-//assign bg = misc_out.bg;
+assign bg = misc_out.bg;
 assign e = misc_out.e;
 
 

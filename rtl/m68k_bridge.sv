@@ -16,12 +16,23 @@ typedef enum logic[3:0] {
 	RESET,
 	INIT,
 	S[0:7],
-	P[5:7]
+	P[5:7],
+	B[1:2]
 } m68k_state;
 
 m68k_state state;
 
 reg reset_pending;
+
+// Sychronise BG and BGACK;
+reg br_i,bgack_i;
+
+always @(posedge clks.sysclk) begin
+	if(clks.clk7_en_n) begin // Falling edge of clk7 according to 68000 UM
+		br_i <= m_misc_in.br;
+		bgack_i <= m_misc_in.bgack;
+	end
+end
 
 always @(posedge clks.sysclk) begin
 	case(state)
@@ -46,7 +57,7 @@ always @(posedge clks.sysclk) begin
 				state <= S0;
 			end
 		end
-		
+
 		S0: begin
 				// STATE 0 (posedge):
 				// The read cycle starts in state 0 (S0). The processor places valid function
@@ -60,14 +71,15 @@ always @(posedge clks.sysclk) begin
 					m_addr.drive<=1'b0; // Address bus still needs to be high-z.
 					m_data_out.drive<=1'b0;
 					m_data_out.dq_en<=1'b0; // Data bus high-z
-				end
 
-				if(clks.clk7_en_p && (cpu_req.req!=cpu_resp.ack)) begin
-					m_misc_out.fc<={cpu_req.supervisor,cpu_req.ifetch,~cpu_req.ifetch};
-					m_addr.a_en<=1'b1;
-					state <= S1;
+					// Bus arbitration
+					if(!br_i) begin // External device wants the bus
+						state <= B1;
+					end else if(cpu_req.req!=cpu_resp.ack) begin // Regular cycle
+						m_misc_out.fc<={cpu_req.supervisor,cpu_req.ifetch,~cpu_req.ifetch};
+						state <= S1;
+					end
 				end
-
 			end
 			
 		S1: begin
@@ -75,6 +87,7 @@ always @(posedge clks.sysclk) begin
 				// Entering state 1 (S1), the processor drives a valid address on the address bus.
 				if(clks.clk7_en_n) begin
 					m_addr.a <= cpu_req.addr[23:1];
+					m_addr.a_en<=1'b1;
 					m_addr.drive <= 1'b1;
 					state <= S2;
 				end
@@ -125,12 +138,22 @@ always @(posedge clks.sysclk) begin
 						m_addr.lds <= ~cpu_req.dm[0];
 					end
 
+					// The test for DTACK should happen at the negedge...
+					state <= S5;
+				end
+			end
+
+		S5: begin
+				// STATE 5 (negedge)
+				// During state 5 (S5), no bus signals are altered.
+
+				// On the entry to this state (i.e. clock negedge), check for DTACK, etc.
+				if(clks.clk7_en_n) begin
 					if(m_misc_in.dtack==1'b0) begin
-						state <= S5;
+						state <= S6;
 					end
 					if(m_misc_in.berr==1'b0) begin
-						state <= S5;
-					
+						state <= S6;
 					end
 					if(m_misc_in.vpa==1'b0) begin
 						if(!clks.e_internal && !m_misc_out.e) begin // E clock low
@@ -138,14 +161,6 @@ always @(posedge clks.sysclk) begin
 							state <= P5;
 						end
 					end
-				end
-			end
-
-		S5: begin
-				// STATE 5 (negedge)
-				// During state 5 (S5), no bus signals are altered.
-				if(clks.clk7_en_n) begin
-					state <= S6;
 				end
 			end
 
@@ -163,8 +178,8 @@ always @(posedge clks.sysclk) begin
 				// data from the addressed device and negates AS, U D S, and LDS. At
 				// the rising edge of S7, the processor places the address bus in the high-
 				// impedance state. The device negates DTACK or BERR at this time.
+				cpu_resp.q <= m_data_in.d;
 				if(clks.clk7_en_n) begin
-					cpu_resp.q <= m_data_in.d;
 					cpu_resp.ack <= cpu_req.req;
 					m_addr.as<=1'b1;
 					m_addr.uds<=1'b1;
@@ -194,6 +209,26 @@ always @(posedge clks.sysclk) begin
 					m_addr.lds<=1'b1;
 					m_misc_out.vma<=1'b1;
 					state <= S0;				
+				end
+			end
+
+		// Bus arbitration - assert _BG and wait for _BR to drop
+		B1: begin
+				m_misc_out.bg <= 1'b0;
+				if(clks.clk7_en_p) begin
+					if(br_i) begin	// External device has dropped _BR
+						state <= B2;
+					end
+				end
+			end
+
+		// Bus arbitration - _BR has dropped, release _BG and wait for BGACK to drop
+		B2: begin
+				m_misc_out.bg <= 1'b1;
+				if(clks.clk7_en_p) begin
+					if(bgack_i) begin
+						state <= S0;
+					end
 				end
 			end
 				

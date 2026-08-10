@@ -25,7 +25,7 @@
 *                IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR
 *                A PARTICULAR PURPOSE, OR AGAINST INFRINGEMENT.
 *
-*                Copyright © 2001 Micron Semiconductor Products, Inc.
+*                Copyright ï¿½ 2001 Micron Semiconductor Products, Inc.
 *                All rights researved
 *
 * Rev  Author          Date        Changes
@@ -43,6 +43,7 @@
 /* verilator lint_off STMTDLY */
 /* verilator lint_off WIDTH */
 /* verilator lint_off REALCVT */
+/* verilator lint_off SPECIFYIGN */
 
 // Uncomment one of the following to have the appropriate size definitions
 // for the part.
