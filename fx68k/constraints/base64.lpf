@@ -270,6 +270,7 @@ BLOCK JTAGPATHS;
 ## ---------------------------------------------------------------------
 
 MULTICYCLE FROM CELL "cpu/excUnit/U_fx68kAlu/rCcrCore_t3*" TO CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" 2 X ;
+MULTICYCLE FROM CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" TO CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" 2 X ;
 MULTICYCLE FROM CELL "cpu/excUnit/U_fx68kAlu/oper*" TO CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" 2 X ;
 MULTICYCLE FROM CELL "cpu/U_nanoRom_t3/r_rom_q_p1*" TO CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" 2 X ;
 MULTICYCLE FROM CELL "cpu/excUnit/rAlub_t3*" TO CELL "cpu/excUnit/U_fx68kAlu/rPswCcr_t3*" 2 X ;

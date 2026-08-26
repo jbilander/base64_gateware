@@ -242,3 +242,46 @@ define_attribute {i:cpu.excUnit.rAbd_t2*}         {syn_maxfan} {8}
 #   sync flops  -> retime FSM           : real
 #   retime      -> rt_dtack_lo/rt_rd    : real, and the tightest of the
 #                                         three because of ACK_LEAD
+
+# ---------------------------------------------------------------------------
+# The CCR pair as SOURCES.
+#
+# rCcrCore_t3 -> rPswCcr_t3 is already relaxed above, on the grounds that both
+# ends are enabled by enT3 and the path therefore gets a whole microcycle.
+# That argument applies to every combination of the two, but only one of the
+# four was ever written down. These are the other three.
+#
+# Both registers are written on enT3 and nowhere else:
+#
+#     if (enT3 & ftu2Ccr)                    rPswCcr_t3 <= ftu[4:0];
+#     else if (enT3 & ~noCcrEn & (...))      rPswCcr_t3 <= ccrMasked;
+#     if (enT3) begin if (|aluColumn) ...    rCcrCore_t3 <= ccrTemp;
+#
+# and enT3 = enPhi1 & (tState == T2). The same enPhi1 that fires enT3 also
+# advances tState to T3, so tState must run T3 -> T4 -> T1 -> T2 before enT3
+# can fire again. With enPhi1/enPhi2 alternating every master clock that is
+# four master clocks minimum, so -setup 2 is conservative.
+#
+# This is NOT the rAbd_t2 case warned about above. That one is enT2 -> enT3,
+# adjacent phase slots, genuinely one master clock. This is enT3 -> enT3.
+#
+# Without these, all ten P&R errors land on
+#   rPswCcr_t3_pipe_16 -> rPswCcr_t3_pipe_12  and  -> rCcrCore_t3[2]
+# at 12.015 ns against an 11.641 ns budget: the X flag out of the CCR, into
+# the adder carry-in, through the carry chain, and back into the CCR. That is
+# the ADDX/SUBX/ROXL loop, and the 68000 really does do it in one CPU cycle -
+# but a CPU cycle here is four master clocks, not one.
+
+set_multicycle_path -setup 2 -hold 1 \
+    -from [get_cells {cpu.excUnit.U_fx68kAlu.rPswCcr_t3*}] \
+    -to   [get_cells {cpu.excUnit.U_fx68kAlu.rPswCcr_t3*}]
+
+set_multicycle_path -setup 2 -hold 1 \
+    -from [get_cells {cpu.excUnit.U_fx68kAlu.rPswCcr_t3*}] \
+    -to   [get_cells {cpu.excUnit.U_fx68kAlu.rCcrCore_t3*}]
+
+set_multicycle_path -setup 2 -hold 1 \
+    -from [get_cells {cpu.excUnit.U_fx68kAlu.rCcrCore_t3*}] \
+    -to   [get_cells {cpu.excUnit.U_fx68kAlu.rCcrCore_t3*}]
+
+# The trailing * catches the _pipe_N replicas Synplify creates for fanout.

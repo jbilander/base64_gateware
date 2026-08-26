@@ -71,7 +71,11 @@ module fastmem_zii #(
     input  wire        ack_early,
     input  wire [15:0] rdata_live,
     input  wire [15:0] rdata,
-    input  wire        sdram_ready
+    input  wire        sdram_ready,
+
+    // ---- mapROM control, from the turbomem status window ----
+    input  wire        maprom_load,  // writes to the ROM banks land in SDRAM
+    input  wire        maprom_active // reads from the ROM banks come from SDRAM
 );
 
 // ---------------------------------------------------------------------------
@@ -299,6 +303,51 @@ wire       owns = in_window && addr_match[slot];
 wire       cpu_win = CPUSPACE_EN && (a[31:24] == 8'h08);
 
 // ---------------------------------------------------------------------------
+// mapROM
+//
+// Kickstart lives on the motherboard and answers at 7 MHz with wait states,
+// while this core runs at 42.5 MHz. Roughly 87% of Kickstart cycles are ROM
+// fetches, so shadowing the ROM into SDRAM and answering it on-chip is the
+// largest speedup left in the design.
+//
+// Two banks, in the reserved megabyte at SDRAM words 0x400000-0x47FFFF:
+//
+//   $F80000-$FFFFFF  a[23:19] 11111  boot bank      -> word 0x400000 + a[18:1]
+//   $E00000-$E7FFFF  a[23:19] 11100  extended bank  -> word 0x440000 + a[18:1]
+//
+// DELIBERATELY NOT SHADOWED, and both exclusions matter:
+//
+//   $E80000-$EFFFFF  11101  the autoconfig space. fastmem, turbomem and the
+//                           SD card all live here.
+//   $F00000-$F7FFFF  11110  exec scans this range for ROMTAGs -- it is in the
+//                           default scan table as the A590-style expansion ROM
+//                           bank. Shadowing it with uninitialised SDRAM would
+//                           let a stray $4AFC become a Resident structure that
+//                           Kickstart tries to InitResident().
+//
+// TWO CONTROL BITS, both cleared by reset so a machine that does nothing
+// behaves exactly as before:
+//
+//   maprom_load    writes to the banks go to SDRAM instead of nowhere. This is
+//                  the ONLY way software can reach the shadow -- it is not in
+//                  any CPU window. It doubles as the write protect: with it
+//                  clear the shadow ignores writes exactly like real ROM.
+//   maprom_active  reads come from SDRAM instead of the motherboard.
+//
+// So the copy is `move.l (a0)+,(a1)+` with both pointers at $F80000 and only
+// load set: the read goes to the real ROM, the write lands in the shadow.
+// About 0.3 s for the megabyte, all of it before DOS.
+//
+// A bank that is not populated must not be copied. On a stock A500 there is
+// no extended ROM and $E00000 reads open bus; shadow that and a Kickstart
+// whose scan table covers $E0 finds garbage. Checking the bank header is the
+// tool's job, not the gateware's.
+// ---------------------------------------------------------------------------
+wire mr_boot = (a[23:19] == 5'b11111);
+wire mr_ext  = (a[23:19] == 5'b11100);
+wire mr_win  = (a[31:24] == 8'h00) && (mr_boot || mr_ext);
+
+// ---------------------------------------------------------------------------
 // REGISTERED WINDOW DECODE
 //
 // fm_space gates fm_req_now, which reaches the SDRAM controller's S_IDLE
@@ -318,13 +367,19 @@ wire       cpu_win = CPUSPACE_EN && (a[31:24] == 8'h08);
 // saddr_r, which is itself a register, so that path is already a normal
 // one-clock hop; using the registered copy there would put the address
 // two clocks behind and eat the whole margin.
-reg owns_r, cpu_win_r;
+reg owns_r, cpu_win_r, mr_win_r;
 always @(posedge clk) begin
     owns_r    <= owns;
     cpu_win_r <= cpu_win;
+    mr_win_r  <= mr_win;
 end
 
-assign fm_space  = (owns_r || cpu_win_r) && !as_n;
+// rw stays combinational for the same reason `we` does, noted below: R/W goes
+// low at S2, simultaneously with AS, so a registered copy would still read
+// "read" on a write cycle. The address compare is what gets registered.
+wire mr_space = mr_win_r && ((rw & maprom_active) | (~rw & maprom_load));
+
+assign fm_space  = (owns_r || cpu_win_r || mr_space) && !as_n;
 
 // OPT A: combinational request. Reads start when DS is valid (on a 68000 read
 // DS asserts with AS, so effectively immediately); writes start at decode time
@@ -385,7 +440,10 @@ wire [3:0] dense_mb = popcount_below(addr_match, slot);   // which MB in SDRAM
 // The mapROM MB is reserved here rather than left to chance so that a
 // later ROM-shadow implementation has somewhere to live that no window
 // can reach. Nothing decodes it yet; it is simply not handed to anything.
-wire [23:0] sdram_word = cpu_win ? {1'b1, a[23:1]}
+// mr_win keeps the COMBINATIONAL compare for the same reason cpu_win does:
+// this feeds saddr_r, which is a register, so it is already a one-clock hop.
+wire [23:0] sdram_word = mr_win  ? {5'b01000, mr_ext, a[18:1]}
+                       : cpu_win ? {1'b1, a[23:1]}
                                  : {1'b0, dense_mb, a[19:1]};
 
 // ---------------------------------------------------------------------------

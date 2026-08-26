@@ -34,6 +34,7 @@ wire        cfgout_n, tm_configured;
 wire [7:0]  tm_base;
 
 localparam [63:0] STAT_TEST = 64'h1234_0003_0006_544D;
+wire mr_load, mr_active;
 integer errors = 0;
 integer i;
 
@@ -55,7 +56,8 @@ turbomem_zii #(
     .tm_ac_access (tm_ac_access), .tm_ac_dout (tm_ac_dout),
     .tm_ac_oe (tm_ac_oe), .tm_ac_dtack_n (tm_ac_dtack_n),
     .cfgout_n (cfgout_n), .tm_base (tm_base),
-    .tm_configured (tm_configured)
+    .tm_configured (tm_configured),
+    .maprom_load (mr_load), .maprom_active (mr_active)
 );
 
 // A SECOND board downstream of the first, so the bench exercises the actual
@@ -86,7 +88,8 @@ turbomem_zii #(
     .tm_ac_access (tm2_ac_access), .tm_ac_dout (tm2_ac_dout),
     .tm_ac_oe (tm2_ac_oe), .tm_ac_dtack_n (tm2_ac_dtack_n),
     .cfgout_n (cfgout2_n), .tm_base (tm2_base),
-    .tm_configured (tm2_configured)
+    .tm_configured (tm2_configured),
+    .maprom_load (), .maprom_active ()
 );
 
 // What base64_top's core_iedb mux, int_dtack_lo and int_space do, in
@@ -384,6 +387,30 @@ initial begin
     check("boot_ms at +$F006",{16'd0, w}, 32'h00001234);
     bus_read({8'h00, 8'hE9, 3'b001, 12'd0}, w);
     check("ROM at +$2000 still intact", {16'd0, w}, {16'd0, gold[0]});
+
+    // ---- 15. mapROM control register at +$F008 ---------------------------
+    // A stray write must not be able to switch Kickstart fetches to an
+    // unfilled shadow: that is an instant, undiagnosable death.
+    $display("\n[15] mapROM control register");
+    check("both bits clear at reset", {30'd0, mr_active, mr_load}, 32'd0);
+
+    bus_write({8'h00, 8'hE9, 4'hF, 8'd0, 3'b100}, 16'h0003);   // no key
+    check("unkeyed write ignored", {30'd0, mr_active, mr_load}, 32'd0);
+    bus_write({8'h00, 8'hE9, 4'hF, 8'd0, 3'b100}, 16'hFFFF);   // stray -1
+    check("stray \$FFFF ignored",  {30'd0, mr_active, mr_load}, 32'd0);
+
+    bus_write({8'h00, 8'hE9, 4'hF, 8'd0, 3'b100}, 16'h5A01);   // load
+    check("keyed write sets load", {30'd0, mr_active, mr_load}, 32'd1);
+    bus_read ({8'h00, 8'hE9, 4'hF, 8'd0, 3'b100}, w);
+    check("reads back",           {16'd0, w}, 32'h00000001);
+
+    bus_write({8'h00, 8'hE9, 4'hF, 8'd0, 3'b100}, 16'h5A02);   // active
+    check("active only",          {30'd0, mr_active, mr_load}, 32'd2);
+    bus_write({8'h00, 8'hE9, 4'hF, 8'd0, 3'b100}, 16'h5A00);   // off
+    check("cleared",              {30'd0, mr_active, mr_load}, 32'd0);
+
+    bus_read({8'h00, 8'hE9, 3'b001, 12'd0}, w);
+    check("ROM at +\$2000 intact", {16'd0, w}, {16'd0, gold[0]});
 
     $display("\n=== %0d error(s) ===\n", errors);
     if (errors == 0) $display("PASS\n"); else $display("FAIL\n");

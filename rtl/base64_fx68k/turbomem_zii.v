@@ -168,7 +168,11 @@ module turbomem_zii #(
     // ---- chain + debug ----
     output reg         cfgout_n,     // to the CFGOUT pin
     output wire [7:0]  tm_base,     // assigned A23:A16, for Reveal
-    output wire        tm_configured
+    output wire        tm_configured,
+
+    // ---- mapROM control, to fastmem_zii ----
+    output wire        maprom_load,
+    output wire        maprom_active
 );
 
 localparam integer ROM_WORDS = (1 << ROM_AWID);
@@ -328,12 +332,55 @@ always @(posedge clk) rom_q <= rom[a[ROM_AWID:1]];
 
 // Status window. Registered alongside rom_q so both arrive together and the
 // output mux below is a plain select, not a second timing path.
+//
+//   +$F000  magic $544D        read-only
+//   +$F002  flags              read-only
+//   +$F004  resets needed      read-only
+//   +$F006  ms to boot         read-only
+//   +$F008  mapROM control     READ/WRITE
+//   +$F00A..            reserved, read as zero
+//
+// The mapROM control register needs a key. A stray write of 0 is harmless,
+// but a stray write with bit 1 set would switch Kickstart fetches over to an
+// SDRAM shadow that has not been filled -- the next instruction fetch is
+// garbage and the machine is gone with no diagnostic. Requiring $5A in the
+// high byte means only a deliberate write can do it.
+//
+//   move.w #$5A01,base+$F008    load:   writes to the ROM banks -> shadow
+//   move.w #$5A02,base+$F008    active: reads from the banks    -> shadow
+//   move.w #$5A00,base+$F008    off
+//
+// Both bits clear on reset, so a machine that never writes here behaves
+// exactly as it did before mapROM existed.
+localparam [7:0] MAPROM_KEY = 8'h5A;
+
 wire       status_hit = STATUS_EN && (a[15:12] == 4'hF);
 reg        status_sel;
 reg [15:0] status_q;
+reg  [1:0] mr_ctrl = 2'b00;      // {active, load}
+
+assign maprom_load   = mr_ctrl[0];
+assign maprom_active = mr_ctrl[1];
+
 always @(posedge clk) begin
     status_sel <= status_hit;
-    status_q   <= status_i[{a[2:1], 4'b0000} +: 16];
+    if (a[3])
+        status_q <= (a[2:1] == 2'd0) ? {14'd0, mr_ctrl} : 16'h0000;
+    else
+        status_q <= status_i[{a[2:1], 4'b0000} +: 16];
+end
+
+// Write strobe on the leading edge of DS, same shape as the autoconfig one.
+wire ctrl_wr = status_hit && !ds_n && !rw && (a[3:1] == 3'd4);
+reg  ctrl_wr_q;
+always @(posedge clk) ctrl_wr_q <= ctrl_wr;
+wire ctrl_stb = ctrl_wr & ~ctrl_wr_q;
+
+always @(posedge clk) begin
+    if (reset)
+        mr_ctrl <= 2'b00;
+    else if (ctrl_stb && (d_in[15:8] == MAPROM_KEY))
+        mr_ctrl <= d_in[1:0];
 end
 
 // ---------------------------------------------------------------------------

@@ -93,7 +93,15 @@ DIAG_STUB ?= 0
 #   red->white  called, probe read back wrong -- suspect $08000000
 DIAG_TRACE ?= 0
 
-DIAGFLAGS  = -DDIAG_STUB=$(DIAG_STUB) -DDIAG_TRACE=$(DIAG_TRACE)
+# make rom DIAG_MAPROM=1 -> DiagPoint shadows Kickstart into SDRAM before DOS.
+# Needs gateware with the mapROM window; the routine checks for the $544D
+# status magic and does nothing if it is absent, so an old bitstream is safe.
+# Off by default: keeping it a build flag is the rollback, because a machine
+# that will not boot cannot be told to turn mapROM off.
+DIAG_MAPROM ?= 0
+
+DIAGFLAGS  = -DDIAG_STUB=$(DIAG_STUB) -DDIAG_TRACE=$(DIAG_TRACE) \
+             -DDIAG_MAPROM=$(DIAG_MAPROM)
 # --emit-relocs IS REQUIRED FOR THE HUNK BUILD.
 #
 # DOS loads a hunk executable wherever it likes and fixes up absolute
@@ -126,7 +134,7 @@ LDFLAGS   = -nostdlib -nostartfiles -T turbomem.ld
 TESTLD    = $(LDFLAGS) -Wl,--emit-relocs
 ROMLD     = $(LDFLAGS)
 
-.PHONY: all test rom hello cfgdump check-lvo check-pic check-a6 check-entry check-relocs check-diag install-mem clean
+.PHONY: all test rom hello cfgdump maprom check-lvo check-pic check-a6 check-entry check-relocs check-diag install-mem clean
 all: test
 
 # ---------------------------------------------------------------------
@@ -178,6 +186,17 @@ cfgdump: | $(TESTDIR)
 	@$(MAKE) --no-print-directory check-entry \
 	    ENTRY_ELF=$(TESTDIR)/CfgDump.elf
 	@echo "--> $(TESTDIR)/CfgDump"
+
+# Fills the mapROM shadow and switches Kickstart over to it. Needs gateware
+# with the mapROM window (the status magic at +$F000 is the version check).
+maprom: | $(TESTDIR)
+	$(CC) $(CFLAGS) -o $(TESTDIR)/MapROM.elf \
+	    maprom.c $(TESTLD) -Wl,-Map=$(TESTDIR)/MapROM.map
+	elf2hunk $(TESTDIR)/MapROM.elf $(TESTDIR)/MapROM
+	$(OBJDUMP) -D $(TESTDIR)/MapROM.elf > $(TESTDIR)/MapROM.s
+	@$(MAKE) --no-print-directory check-entry \
+	    ENTRY_ELF=$(TESTDIR)/MapROM.elf
+	@echo "--> $(TESTDIR)/MapROM"
 
 # ---------------------------------------------------------------------
 # ROM image
@@ -283,6 +302,10 @@ check-lvo:
 	@grep -rn -A4 "AddMemList" $(NDK)/sys-include/inline/exec.h || true
 	@echo "=== assembler LVO equates ==="
 	@grep -rn "_LVOAddMemList" $(NDK) || true
+	@echo "=== Disable / Enable, for the mapROM switchover ==="
+	@echo "    the LP macro's first argument is the LVO in hex, positive;"
+	@echo "    Disable should be 0x78 (-120) and Enable 0x7e (-126)"
+	@grep -rn -A1 "define Disable\|define Enable" $(NDK)/sys-include/inline/exec.h || true
 	@echo "=== DiagArea layout and DAC_ flags ==="
 	@grep -rn "da_DiagPoint\|DAC_WORDWIDE\|DAC_CONFIGTIME\|DAC_NEVER\|struct DiagArea" $(NDK)/sys-include/ || true
 	@echo "=== DiagPoint calling convention (autodocs, if shipped) ==="

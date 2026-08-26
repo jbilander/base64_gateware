@@ -99,6 +99,28 @@ static void call_AddMemList(struct ExecBase *sysbase,
                   : "cc", "memory");
 }
 
+/* Disable is exec LVO -120, Enable -126. Both V33, both take only A6.
+ * VERIFY WITH `make check-lvo` before trusting these: a wrong LVO here lands
+ * in a neighbouring function while interrupts are in an unknown state. */
+#define LVO_Disable  (-120)
+#define LVO_Enable   (-126)
+
+static void call_Disable(struct ExecBase *sysbase)
+{
+    register struct ExecBase *a6 asm("a6") = sysbase;
+    asm volatile ("jsr %c1(%0)"
+                  : : "r"(a6), "i"(LVO_Disable)
+                  : "d0", "d1", "a0", "a1", "cc", "memory");
+}
+
+static void call_Enable(struct ExecBase *sysbase)
+{
+    register struct ExecBase *a6 asm("a6") = sysbase;
+    asm volatile ("jsr %c1(%0)"
+                  : : "r"(a6), "i"(LVO_Enable)
+                  : "d0", "d1", "a0", "a1", "cc", "memory");
+}
+
 /* AllocMem is exec LVO -198, V33, not poisoned. Same explicit-register
  * form as call_AddMemList and for the same reason. CLI build only -- the
  * ROM has no use for it, see the note at the call site. */
@@ -264,6 +286,28 @@ ULONG turbomem_add(struct ExecBase *sysbase)
 #define DIAG_TRACE_LOOPS 1500000UL
 #endif
 
+/* DIAG_MAPROM -- shadow Kickstart into SDRAM at DiagPoint time.
+ *
+ * Kickstart answers at 7 MHz with a wait state while the core runs at
+ * 42.5 MHz, and most of what the OS executes is ROM code. Copying it into
+ * the SDRAM shadow and serving it on-chip measures about 2x on word reads
+ * and 4x on multiple reads.
+ *
+ * Doing it here rather than from a CLI tool means it is in effect before
+ * DOS, with nothing for the user to run. Unlike a mapROM that loads a
+ * DIFFERENT Kickstart, no second reset is needed: the shadow holds the same
+ * bytes as the ROM it replaces, verified by checksum, so nothing the system
+ * has already built from ROM becomes stale.
+ *
+ * Off by default. Build with DIAG_MAPROM=1. Keeping it a build flag is the
+ * rollback: if mapROM ever turns out to upset something, a ROM image without
+ * it is one make away, which matters because a machine that will not boot
+ * cannot run MapROM OFF.
+ */
+#ifndef DIAG_MAPROM
+#define DIAG_MAPROM 0
+#endif
+
 #ifndef DIAG_STUB
 #define DIAG_STUB 0
 #endif
@@ -382,7 +426,104 @@ asm(
  * So: non-zero, permanently. Not just during bring-up. The copy is ~200
  * bytes and exec owns it for the life of the machine, exactly as it owns
  * the AllocMem'd copy the CLI build makes. */
-ULONG diag_point(void);
+/* No forward declaration: a register parameter is only allowed on a
+ * definition, and nothing in C calls this -- expansion.library reaches it
+ * through the da_DiagPoint offset in the asm block above. */
+
+#if DIAG_MAPROM && !DIAG_STUB
+
+/* The status window in this board's own address space. */
+#define MR_MAGIC_OFS  0xF000
+#define MR_CTRL_OFS   0xF008
+#define MR_MAGIC      0x544D
+
+/* Writes need $5A in the high byte or the gateware ignores them. */
+#define MR_OFF        0x5A00
+#define MR_LOAD       0x5A01
+#define MR_ACTIVE     0x5A02
+
+#define MR_BOOT_BASE  0x00F80000UL
+#define MR_EXT_BASE   0x00E00000UL
+#define MR_BANK_SIZE  0x00080000UL      /* 512 KB per bank */
+
+/* Order dependent on purpose. A plain sum would not notice a copy that
+ * landed in the wrong order, which is exactly the address-mapping mistake
+ * this is here to catch. */
+static ULONG mr_sum(ULONG base)
+{
+    volatile ULONG *p = (volatile ULONG *)base;
+    ULONG i, s = 0;
+
+    for (i = 0; i < MR_BANK_SIZE / 4; i++)
+        s = ((s << 1) | (s >> 31)) + p[i];
+    return s;
+}
+
+/* With LOAD set and ACTIVE clear the same address does different things for
+ * read and write: the read goes to the motherboard ROM, the write lands in
+ * the shadow. So the copy needs no second window. */
+static void mr_copy(ULONG base)
+{
+    volatile ULONG *src = (volatile ULONG *)base;
+    ULONG          *dst = (ULONG *)base;
+    ULONG i;
+
+    for (i = 0; i < MR_BANK_SIZE / 4; i++)
+        dst[i] = src[i];
+}
+
+/* BOTH BANKS ARE ALWAYS COPIED, VERBATIM, WITH NO INSPECTION.
+ *
+ * There is one ACTIVE bit covering both ranges, so a bank that is skipped is
+ * still redirected - to shadow nobody filled. On a 1 MB Kickstart that is
+ * live code and the CPU executes noise. Copying whatever the motherboard
+ * returns, whether that is real ROM or an alias of the other bank because
+ * the chip has no A19 to tell them apart, means switching over cannot change
+ * what the machine sees.
+ *
+ * Returns 1 if mapROM is left active.
+ */
+static int maprom_fill(APTR board, struct ExecBase *sysbase)
+{
+    volatile UWORD *magic = (volatile UWORD *)((UBYTE *)board + MR_MAGIC_OFS);
+    volatile UWORD *ctrl  = (volatile UWORD *)((UBYTE *)board + MR_CTRL_OFS);
+    ULONG boot_sum, ext_sum;
+    int   ok;
+
+    /* Gateware without the mapROM window reads as ROM here, not as $544D. */
+    if (*magic != MR_MAGIC)
+        return 0;
+
+    boot_sum = mr_sum(MR_BOOT_BASE);
+    ext_sum  = mr_sum(MR_EXT_BASE);
+
+    *ctrl = MR_LOAD;
+    mr_copy(MR_BOOT_BASE);
+    mr_copy(MR_EXT_BASE);
+    *ctrl = MR_OFF;                     /* close the write window again */
+
+    /* From the moment ACTIVE is set until it is cleared again, every ROM
+     * fetch comes from the shadow -- including any interrupt handler that
+     * happens to fire. So: interrupts off, and call NOTHING that lives in
+     * ROM until we have decided.
+     *
+     * call_Enable is a ROM call, but by then either the shadow verified
+     * (so it is safe to run from) or ACTIVE is already back off (so it
+     * comes from the motherboard as before). Either way it is reached. */
+    call_Disable(sysbase);
+
+    *ctrl = MR_ACTIVE;
+
+    ok = (mr_sum(MR_BOOT_BASE) == boot_sum) &&
+         (mr_sum(MR_EXT_BASE)  == ext_sum);
+
+    if (!ok)
+        *ctrl = MR_OFF;
+
+    call_Enable(sysbase);
+    return ok;
+}
+#endif /* DIAG_MAPROM && !DIAG_STUB */
 
 #if DIAG_TRACE && !DIAG_STUB
 static void diag_flash(UWORD colour)
@@ -395,9 +536,10 @@ static void diag_flash(UWORD colour)
 }
 #endif
 
-ULONG diag_point(void)
+ULONG diag_point(APTR board asm("a0"))
 {
 #if DIAG_STUB
+    (void)board;
     return 1;
 #else
     struct ExecBase *sysbase;
@@ -418,6 +560,16 @@ ULONG diag_point(void)
     /* Ignore the result. There is nowhere to report a failed probe from
      * here, and adding nothing is the correct outcome either way. */
     (void)turbomem_add(sysbase);
+#endif
+
+#if DIAG_MAPROM
+    /* AFTER turbomem_add, deliberately. The memory is the proven feature;
+     * if mapROM ever misbehaves, having the fast RAM already added narrows
+     * the fault to this call rather than to both. There is nowhere to
+     * report a failure from here either, but a shadow that does not verify
+     * simply leaves mapROM off and the machine boots as before -- and
+     * cfgdump can read the control register afterwards to say which. */
+    (void)maprom_fill(board, sysbase);
 #endif
 
     return 1;

@@ -1242,6 +1242,7 @@ module base64_top #(
     wire [3:0]  sd_ac_dout;
     wire [7:0]  base_sd;
     wire        sd_configured;
+    wire        maprom_load, maprom_active;   // turbomem $F008 -> fastmem
     wire        ac_chain_n;      // fastmem CFGOUT  -> turbomem CFGIN
     wire        ac_chain2_n;     // turbomem CFGOUT -> SD CFGIN
     wire        sd_req, sd_we, sd_ack, sd_ready, sd_wr_valid, sd_ack_early;
@@ -1302,7 +1303,9 @@ module base64_top #(
         .ack_early  (sd_ack_early),
         .rdata_live (sd_rdata_live),
         .rdata      (sd_rdata),
-        .sdram_ready(sd_ready)
+        .sdram_ready(sd_ready),
+        .maprom_load  (maprom_load),
+        .maprom_active(maprom_active)
     );
 
     // ROM_FILE: turbomem.mem MUST BE A MEMBER OF THE DIAMOND PROJECT.
@@ -1363,7 +1366,9 @@ module base64_top #(
         .tm_ac_dtack_n(tm_ac_dtack_n),
         .cfgout_n     (ac_chain2_n),
         .tm_base      (tm_base),
-        .tm_configured(tm_configured)
+        .tm_configured(tm_configured),
+        .maprom_load  (maprom_load),
+        .maprom_active(maprom_active)
     );
 
     // ---------------------------------------------------------------------
