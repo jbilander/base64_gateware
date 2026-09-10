@@ -42,11 +42,11 @@ see the core section of the README. An unfixed fork will not boot.
 
 Four `.mem` files are loaded by `$readmemh`/`$readmemb` at synthesis:
 
-| File | |
+| File | Where it comes from |
 | --- | --- |
-| `microrom.mem`, `nanorom.mem` | fx68k microcode |
-| `turbomem.mem` | the DiagArea ROM that calls `AddMemList` |
-| `sfsd.mem` | the SD card boot ROM |
+| `microrom.mem`, `nanorom.mem` | ship with the fx68k core |
+| `turbomem.mem` | built by `make rom` in `sw/turbomem` |
+| `sfsd.mem` | converted by hand from LIV2's `sfsd.rom`, see below |
 
 **All four must be members of the Diamond project**, and they resolve against
 the directory synthesis runs in — the implementation directory, not the RTL
@@ -60,6 +60,37 @@ When one is missing the failure is silent and convincing: the array
 constant-folds to zero, Synplify prunes the read register, and the design
 builds and runs while that ROM serves nothing but zeroes. A missing
 `microrom.mem` gives a CPU that executes garbage with no error at all.
+
+### Regenerating a .mem from a ROM image
+
+`turbomem.mem` is produced by `make rom`. `sfsd.mem` is not: the SD card boot
+ROM is maintained upstream in
+[LIV2/amiga-par-to-spi-adapter](https://github.com/LIV2/amiga-par-to-spi-adapter)
+and published as `sfsd.rom`, so it has to be converted whenever a new one
+appears.
+
+```sh
+hexdump -v -e '1/1 "%02X" "\n"' sfsd.rom      > sfsd.mem       # BYTE-wide
+hexdump -v -e '2/1 "%02x" "\n"' turbomem.bin  > turbomem.mem   # WORD-wide
+```
+
+**Note `1/1` against `2/1`.** The two files are not the same shape.
+`sfsd.mem` is byte-wide, one byte per line, because the SD boot ROM is served
+on D[7:0] at odd addresses. `turbomem.mem` is word-wide, two bytes per line,
+because the DiagArea is `DAC_WORDWIDE`. Use the wrong one and you get a file
+that loads without complaint and serves nonsense.
+
+Worth checking after a conversion — a truncated or wrongly cased file will
+still load:
+
+```sh
+wc -l sfsd.mem                        # 32768
+grep -cvE '^[0-9A-F]{2}$' sfsd.mem    # 0
+```
+
+`sfsd.mem` has to be copied to both `rtl/base64_fx68k/` and the Diamond
+implementation directory by hand; `make install-mem` only handles
+`turbomem.mem`.
 
 ## Strategy settings
 
