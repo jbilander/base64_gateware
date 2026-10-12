@@ -31,6 +31,12 @@
 //   6. BG is retimed onto the 7M grid.
 //   7. The bridge, not the core, owns the physical pins (latched address /
 //      data / strobes), because the core moves on as soon as it is acked.
+//   8. VMA is held past E's FALLING edge (VMA_HOLD). A 6800 peripheral
+//      latches write data on that edge with chip select still asserted, and
+//      a real 68000 negates VMA in S7, after E is already low. Dropping VMA
+//      on the same clock edge E falls leaves zero hold and makes the write
+//      depend on Gary's VMA->CS delay versus the E path to the CIA, i.e. on
+//      board layout. See section 10b.
 //
 // PHASE_OFS is KEPT and now has a physical meaning: it aligns our internal
 // notion of the 7M rising edge with the real one at Gary/Agnus, absorbing the
@@ -133,6 +139,31 @@ module base64_top #(
     // e_cnt 0..5, high for 6..9, so 1 gives ~700 ns of VMA setup before E
     // rises. Anything in 0..3 is safe.
     parameter [3:0]   E_VMA_AT   = 4'd1,
+
+    // Hold VMA (and therefore AS/DS/RW/data, because the core cannot negate
+    // AS before it sees DTACK) for one half 7M period -- 70 ns -- past E's
+    // FALLING edge, instead of dropping it on the same clock edge.
+    //
+    // WHY THIS EXISTS. An 8520 latches a write on E's falling edge with its
+    // chip select still asserted. Gary gates CIAA/CIAB CS with VMA, so if
+    // VMA is removed on the edge E falls, whether the write lands at all is
+    // decided by Gary's VMA->CS propagation against the E distribution path
+    // -- a race whose sign changes with board layout and chip lot. A real
+    // 68000 negates VMA in S7, with E already low, and has no such race;
+    // that is why the fault below appears with this board in the socket and
+    // not with the DIP CPU.
+    //
+    // Symptom it was added for: on remake A500/A500+ boards (A500++,
+    // Raemixx500) AmigaTestKit 1.21's CIA Timer Test reported every tick
+    // count correct and every IRQ count zero. The only register write that
+    // test performs is the CIA ICR mask; lose it and the timers keep
+    // counting while the CIA never raises /IRQ, which is exactly that
+    // screenshot. Passed on original Commodore Rev 8A and Rev 6A boards.
+    //
+    // 0 restores the previous behaviour, for A/B testing. Costs 70 ns on a
+    // cycle that already takes ~1.4 us, so there is no reason to turn it off
+    // other than to reproduce the fault.
+    parameter         VMA_HOLD   = 1'b1,
 
     // 1 = terminate IACK cycles internally with 24+level (recommended).
     parameter         IACK_AV    = 1'b1,
@@ -1196,8 +1227,28 @@ module base64_top #(
                         rt_vma_n <= 1'b0; rt_vst <= 2'd1;
                     end
                 end else if (rt_vst == 2'd1) begin
+                    // E falls on THIS tick (e_fall_tick is tick_r with
+                    // e_cnt==9, the same edge that reloads e_pin to 0). Do
+                    // not drop VMA here: go to state 3 and hold it to the
+                    // next tick_f, 70 ns later, which is what ST_VPAH ->
+                    // ST_VPAX does in the bridge FSM below. Deferring the
+                    // ack with it also holds AS, UDS/LDS, R/W and the write
+                    // data, because the core cannot negate AS until it has
+                    // seen DTACK.
                     if (e_fall_tick) begin
-                        rt_vma_n <= 1'b1; rt_dtack_lo <= 1'b1; rt_vst <= 2'd2;
+                        if (VMA_HOLD) begin
+                            rt_vst <= 2'd3;
+                        end else begin
+                            rt_vma_n    <= 1'b1;
+                            rt_dtack_lo <= 1'b1;
+                            rt_vst      <= 2'd2;
+                        end
+                    end
+                end else if (rt_vst == 2'd3) begin
+                    if (tick_f) begin           // 70 ns of VMA/CS hold
+                        rt_vma_n    <= 1'b1;
+                        rt_dtack_lo <= 1'b1;
+                        rt_vst      <= 2'd2;
                     end
                 end
             end
